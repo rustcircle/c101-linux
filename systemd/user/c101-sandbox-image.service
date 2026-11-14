@@ -1,0 +1,17 @@
+# c101-linux managed unit
+# Builds or refreshes c101's desktop-sandbox image with Podman. Started by c101-sandbox-image.timer or by hand:
+#   systemctl --user start c101-sandbox-image.service      (follow with: journalctl --user -u c101-sandbox-image -f)
+[Unit]
+Description=Build or refresh the c101 desktop-sandbox image with Podman
+Documentation=file://%h/.claude/stack/docs/MCP.md
+ConditionPathExists=%h/.claude/stack/bin/desktop-sandbox
+
+[Service]
+Type=oneshot
+# The installer rewrites this line when you chose --no-podman-wrapper (plain podman).
+Environment=DESKTOP_SANDBOX_RUNTIME=%h/.local/bin/c101-podman
+# User units get a minimal PATH: cover distro, NixOS (system, per-user, nix-env) and Homebrew-on-Linux locations of podman.
+Environment=PATH=%h/.local/bin:%h/.nix-profile/bin:/etc/profiles/per-user/%u/bin:/run/current-system/sw/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.claude/stack/bin/desktop-sandbox --build --profile recommended --base docker.io/library/debian:bookworm-slim
+TimeoutStartSec=3600
+Nice=10

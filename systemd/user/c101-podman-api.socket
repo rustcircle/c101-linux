@@ -1,0 +1,14 @@
+# c101-linux managed unit
+# Fallback Docker-compatible API socket for rootless Podman, for distros without a podman.socket user unit.
+# The installer enables the distro's own podman.socket instead when it exists, and only installs this pair otherwise.
+[Unit]
+Description=Docker-compatible Podman API socket (c101-linux fallback)
+Documentation=man:podman-system-service(1)
+
+[Socket]
+ListenStream=%t/podman/podman.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,12 @@
+# agent/run artefacts
+.stack/
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# os / editor
+.DS_Store
+*.swp
+# local test scratch
+/tmp/

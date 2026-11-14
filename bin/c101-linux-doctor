@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR/..
+# c101-linux-doctor: read-only health check of the c101 overlay. Prints PASS/WARN/FAIL lines, runs c101's own
+# `bin/stack doctor` last and exits 1 when anything FAILed. Changes nothing.
+# Usage: c101-linux-doctor [--profile NAME] [--skip-c101] [--quiet]
+# shellcheck disable=SC2088  # a literal ~ in messages is for display
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "c101-linux-doctor needs bash >= 4" >&2
+  exit 2
+fi
+set -Eeuo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
+
+C101L_ROOT=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+readonly C101L_ROOT
+
+# shellcheck source=lib/common.sh
+. "$C101L_ROOT/lib/common.sh"
+# shellcheck source=lib/detect.sh
+. "$C101L_ROOT/lib/detect.sh"
+# shellcheck source=lib/profiles.sh
+. "$C101L_ROOT/lib/profiles.sh"
+# shellcheck source=lib/deps.sh
+. "$C101L_ROOT/lib/deps.sh"
+# shellcheck source=lib/c101.sh
+. "$C101L_ROOT/lib/c101.sh"
+# shellcheck source=lib/desktop.sh
+. "$C101L_ROOT/lib/desktop.sh"
+# shellcheck source=lib/pathprofile.sh
+. "$C101L_ROOT/lib/pathprofile.sh"
+# shellcheck source=lib/services.sh
+. "$C101L_ROOT/lib/services.sh"
+
+N_PASS=0 N_WARN=0 N_FAIL=0
+QUIET=0
+pass() { N_PASS=$((N_PASS + 1)); [ "$QUIET" = 1 ] || printf 'PASS  %-22s %s\n' "$1" "$2"; return 0; }
+warn_() { N_WARN=$((N_WARN + 1)); printf 'WARN  %-22s %s\n' "$1" "$2"; return 0; }
+fail() { N_FAIL=$((N_FAIL + 1)); printf 'FAIL  %-22s %s\n' "$1" "$2"; return 0; }
+note() { [ "$QUIET" = 1 ] || printf 'INFO  %-22s %s\n' "$1" "$2"; return 0; }
+
+usage() {
+  cat <<USAGE_EOF
+Usage: c101-linux-doctor [--profile NAME] [--skip-c101] [--quiet]
+  --profile NAME   judge against this profile (default: the one recorded at install time, else standard)
+  --skip-c101      do not run c101's own 'bin/stack doctor'
+  --quiet          print only WARN and FAIL lines
+Exit code: 0 when nothing FAILed, 1 otherwise.
+USAGE_EOF
+}
+
+PROFILE=""
+SKIP_C101=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --profile)
+      [ $# -ge 2 ] || { usage >&2; exit 2; }
+      PROFILE=$2
+      shift
+      ;;
+    --skip-c101) SKIP_C101=1 ;;
+    --quiet) QUIET=1 ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [ "$(uname -s)" != Linux ]; then
+  echo "c101-linux-doctor is Linux only (found $(uname -s))" >&2
+  exit 3
+fi
+
+if [ -z "$PROFILE" ]; then PROFILE=$(state_get profile 2>/dev/null || true); fi
+: "${PROFILE:=standard}"
+profile_load "$PROFILE"
+detect_all
+detect_init
+RUNTIME=$(state_get container_runtime 2>/dev/null || true)
+: "${RUNTIME:=$P_CONTAINER_RUNTIME}"
+STACK=$HOME/.claude/stack
+
+printf 'c101-linux-doctor: profile=%s distro=%s (%s) arch=%s libc=%s\n' "$PROFILE" "$OS_NAME" "$OS_FAMILY" "$ARCH" "$LIBC"
+
+# severity helper: FAIL when Desktop is installed (the symptom is user-visible), WARN otherwise
+desktop_sev() { if desktop_installed; then fail "$@"; else warn_ "$@"; fi; }
+
+# --- NixOS ---------------------------------------------------------------------------------------------------------
+if [ "$IMMUTABLE" = nixos ]; then
+  if [ -e /run/current-system/sw/share/nix-ld ] || [ -n "${NIX_LD:-}" ]; then pass "nix-ld" "enabled (foreign binaries such as uv's Python run)"; else fail "nix-ld" "programs.nix-ld.enable is off: uv and the Python builds it downloads cannot run (docs/PITFALLS.md, NixOS)"; fi
+fi
+
+# --- identity ------------------------------------------------------------------------------------------------------
+if [ "$(effective_uid)" -eq 0 ]; then
+  fail "not-root" "running as root: Claude Desktop refuses to start as root and c101 belongs in a user home"
+else
+  pass "not-root" "uid $(id -u)"
+fi
+
+# --- uv and Python -------------------------------------------------------------------------------------------------
+export PATH="$HOME/.local/bin:$PATH"
+if have uv; then
+  pass "uv" "$(uv --version) at $(command -v uv)"
+  if py=$(uv python find --no-python-downloads 3.13 2>/dev/null) && [ -n "$py" ]; then
+    pass "python-3.13" "$py"
+  else
+    fail "python-3.13" "uv has no CPython 3.13 (c101 pins it): run install-linux.sh or: uv python install 3.13"
+  fi
+else
+  fail "uv" "not found: run install-linux.sh (it bootstraps uv) or see https://docs.astral.sh/uv/"
+fi
+
+# --- node ----------------------------------------------------------------------------------------------------------
+node_state
+if [ "$NODE_OK" = 1 ]; then
+  pass "node" "node $NODE_VERSION with npx"
+elif [ -n "$NODE_VERSION" ]; then
+  warn_ "node" "node $NODE_VERSION (npx: $(have npx && echo yes || echo no)); the Playwright MCP server needs node >= $NODE_MIN_MAJOR with npx"
+else
+  warn_ "node" "node/npx missing: the Playwright MCP server (npx @playwright/mcp) will not start"
+fi
+
+# --- Claude clients ------------------------------------------------------------------------------------------------
+HAVE_CLI=0
+HAVE_DESKTOP=0
+have claude && HAVE_CLI=1
+desktop_installed && HAVE_DESKTOP=1
+if [ "$HAVE_CLI" = 1 ]; then pass "claude-cli" "$(command -v claude)"; fi
+if [ "$HAVE_DESKTOP" = 1 ]; then pass "claude-desktop" "installed"; fi
+if [ "$HAVE_CLI" = 0 ] && [ "$HAVE_DESKTOP" = 0 ]; then
+  if [ "$PROFILE" = ci ]; then
+    warn_ "claude-client" "neither the claude CLI nor Claude Desktop is installed (fine for ci)"
+  else
+    fail "claude-client" "neither the claude CLI nor Claude Desktop found: install-linux.sh --install-cli or --install-desktop"
+  fi
+fi
+
+# --- c101 link and settings ----------------------------------------------------------------------------------------
+if [ -L "$STACK" ] && [ -d "$STACK" ] && is_c101_checkout "$STACK"; then
+  pass "stack-link" "~/.claude/stack -> $(readlink "$STACK")"
+elif [ -e "$STACK" ]; then
+  fail "stack-link" "$STACK exists but is not a link to a c101 checkout"
+else
+  fail "stack-link" "~/.claude/stack missing: run install-linux.sh"
+fi
+
+SETTINGS=$HOME/.claude/settings.json
+if [ -f "$SETTINGS" ]; then
+  if ! helper jsontool.py valid "$SETTINGS" 2>/dev/null; then
+    fail "settings.json" "$SETTINGS is not valid JSON (backups: $SETTINGS.bak-*)"
+  else
+    n=$(helper jsontool.py hook-count "$SETTINGS" "/.claude/stack/bin/stack hook" 2>/dev/null || echo 0)
+    if [ "${n:-0}" -gt 0 ]; then pass "hooks" "$n c101 hook command(s) in settings.json"; else fail "hooks" "no c101 hooks in $SETTINGS: c101 --user did not run"; fi
+    agent=$(helper jsontool.py get "$SETTINGS" agent 2>/dev/null || true)
+    if flag_has --main-agent; then
+      if [ "$agent" = delegator ]; then pass "main-agent" "delegator"; else warn_ "main-agent" "profile expects agent=delegator, settings has '${agent:-none}'"; fi
+    fi
+    if flag_has --enforce-models; then
+      if helper jsontool.py get "$SETTINGS" availableModels >/dev/null 2>&1; then pass "enforce-models" "availableModels set"; else warn_ "enforce-models" "profile expects availableModels in settings.json"; fi
+    fi
+  fi
+else
+  fail "settings.json" "$SETTINGS missing: run install-linux.sh"
+fi
+
+# --- PATH for GUI apps ---------------------------------------------------------------------------------------------
+if [ "$P_PATH_INTEGRATION" = 1 ]; then
+  pf=$(login_profile_file)
+  if path_check_file "$pf"; then
+    pass "login-profile" "one managed block in $(tilde "$pf")"
+    sh_bin=${LOGIN_SHELL_PATH:-/bin/sh}
+    case $LOGIN_SHELL in bash | zsh | fish) ;; *) sh_bin=/bin/sh ;; esac
+    found=$(env -i HOME="$HOME" USER="$(id -un)" PATH=/usr/bin:/bin "$sh_bin" -lc 'command -v uv; command -v npx' 2>/dev/null | tr '\n' ' ' || true)
+    if [ -n "$found" ] && printf '%s' "$found" | grep -q uv; then
+      pass "login-path-effective" "a fresh $LOGIN_SHELL login shell finds: $found"
+    else
+      desktop_sev "login-path-effective" "a fresh $LOGIN_SHELL login shell does not find uv (found: '${found:-nothing}'); Desktop's PATH will be incomplete"
+    fi
+    # stale nvm directory?
+    cur_nvm=$(nvm_default_bin)
+    if [ -n "$cur_nvm" ] && ! grep -qF "${cur_nvm#"$HOME"/}" "$pf" 2>/dev/null; then
+      warn_ "nvm-path" "nvm's default node moved ($cur_nvm): re-run install-linux.sh to refresh the block"
+    fi
+  else
+    desktop_sev "login-profile" "no single c101-linux block in $(tilde "$pf"): Claude Desktop will not see uv/node/docker. Re-run install-linux.sh"
+  fi
+  if envd_wanted "$P_ENVIRONMENT_D"; then
+    if [ -f "$(envd_file)" ]; then pass "environment.d" "$(tilde "$(envd_file)")"; else note "environment.d" "no $(tilde "$(envd_file)") (only needed for GUI sessions without a login shell)"; fi
+  fi
+else
+  note "login-profile" "profile $PROFILE writes no profile files"
+fi
+
+# --- Desktop -------------------------------------------------------------------------------------------------------
+if [ "$P_DESKTOP_CHECKS" = 1 ]; then
+  cfg=${XDG_CONFIG_HOME:-$HOME/.config}/Claude/claude_desktop_config.json
+  if [ -f "$cfg" ]; then
+    if helper desktop_config.py validate --config "$cfg" >/dev/null 2>&1; then pass "desktop-config" "$(tilde "$cfg") is valid JSON"; else fail "desktop-config" "$(tilde "$cfg") is not valid JSON"; fi
+  else
+    note "desktop-config" "no $(tilde "$cfg") yet (created by Desktop on first run)"
+  fi
+  case $KEYRING in
+    gnome-keyring | kwallet) pass "keyring" "$KEYRING daemon running" ;;
+    unknown) note "keyring" "pgrep missing; not checked" ;;
+    *) if [ "$HAVE_DESKTOP" = 1 ]; then warn_ "keyring" "no keyring daemon: Desktop cannot store its sign-in (apt install gnome-keyring, or KDE Wallet; unlock it)"; else note "keyring" "none running (needed once Desktop is installed)"; fi ;;
+  esac
+  case $HAS_KVM in
+    ok) pass "kvm" "/dev/kvm usable (Cowork)" ;;
+    no-access) warn_ "kvm" "/dev/kvm exists but is not accessible: add yourself to the kvm group for Cowork" ;;
+    none) note "kvm" "no /dev/kvm: Cowork will not work (Chat and the Code tab do not need it)" ;;
+  esac
+  if [ "$SESSION_TYPE" = wayland ]; then note "wayland" "Quick Entry on Wayland needs the GlobalShortcuts portal; X11 works directly"; fi
+  [ "$IS_WSL" = 0 ] || warn_ "wsl" "WSL: prefer the headless profile and the Windows Desktop app"
+fi
+
+# --- command links -------------------------------------------------------------------------------------------------
+if [ "$P_LINK_BINS" = 1 ]; then
+  missing=""
+  for b in claude-stack stack-sdk c101-stack; do [ -x "$HOME/.local/bin/$b" ] || missing="$missing $b"; done
+  if [ -z "$missing" ]; then pass "command-links" "claude-stack stack-sdk c101-stack"; else warn_ "command-links" "missing in ~/.local/bin:$missing"; fi
+fi
+
+# --- containers: rootless podman (docker only as a chosen fallback) -----------------------------------------------
+sandbox_expected=0
+if [ "$P_SANDBOX" = 1 ] || [ -n "$(state_get sandbox_image 2>/dev/null || true)" ]; then sandbox_expected=1; fi
+if [ "$RUNTIME" = podman ]; then
+  if have podman; then
+    pass "podman" "$(podman --version)"
+    # Read-only: `podman info` initialises rootless storage on first use, so it only runs once storage exists.
+    detect_container_runtime podman
+    if [ ! -d "$(podman_storage_dir)" ]; then
+      if [ "$sandbox_expected" = 1 ]; then warn_ "podman-info" "podman has never been run by this user (no storage), so the sandbox image cannot exist yet; not probed to stay read-only"; else note "podman-info" "$CONTAINER_NOTE"; fi
+    elif [ "$CONTAINER_OK" = 1 ]; then
+      rootless=$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || echo unknown)
+      driver=$(podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null || echo unknown)
+      cg=$(podman info --format '{{.Host.CgroupsVersion}}' 2>/dev/null || echo unknown)
+      pass "podman-info" "works; rootless=$rootless storage=$driver cgroups=$cg"
+      if [ "$rootless" != true ]; then warn_ "podman-rootless" "podman is not running rootless for this user (rootless=$rootless)"; fi
+      if [ "$driver" = vfs ]; then warn_ "podman-storage" "storage driver is vfs (slow, large): usually an NFS/overlayfs home; see docs/PITFALLS.md"; fi
+      if [ "$cg" != v2 ]; then note "podman-cgroups" "cgroups $cg (v2 is expected on current distros)"; fi
+    else
+      if [ "$sandbox_expected" = 1 ]; then fail "podman-info" "$CONTAINER_NOTE"; else warn_ "podman-info" "$CONTAINER_NOTE"; fi
+    fi
+    if subid_has "$(id -un)" /etc/subuid && subid_has "$(id -un)" /etc/subgid; then
+      pass "subuid-subgid" "ranges present for $(id -un)"
+    elif [ "$(effective_uid)" -ne 0 ]; then
+      if [ "$sandbox_expected" = 1 ]; then fail "subuid-subgid" "missing in /etc/subuid or /etc/subgid: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(id -un); podman system migrate"; else warn_ "subuid-subgid" "no range for $(id -un): rootless podman cannot start containers"; fi
+    fi
+    missing_cg=$(cgroup_missing_controllers)
+    if [ -n "$missing_cg" ]; then
+      if [ "$sandbox_expected" = 1 ]; then fail "cgroup-delegation" "controllers not delegated to your user manager: $missing_cg (Ubuntu 22.04: systemd 249); c101's sandbox passes --cpus, so it cannot start. Fix: install-linux.sh --sandbox writes /etc/systemd/system/user@.service.d/delegate.conf (Delegate=cpu cpuset io memory pids), then log out and in"; else warn_ "cgroup-delegation" "controllers not delegated: $missing_cg (rootless limits will fail; see docs/PITFALLS.md)"; fi
+    else
+      pass "cgroup-delegation" "needed controllers delegated (or cgroup v1/unknown)"
+    fi
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then pass "xdg-runtime-dir" "$XDG_RUNTIME_DIR"; else warn_ "xdg-runtime-dir" "unset: rootless podman needs a login session (or export XDG_RUNTIME_DIR=/run/user/$(id -u))"; fi
+    if have loginctl; then
+      lg=$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || echo unknown)
+      note "linger" "linger=$lg (user units outlive logout only when yes)"
+    fi
+    if [ "$(selinux_mode)" = Enforcing ]; then note "selinux" "enforcing: c101-podman disables label separation for the sandbox container (docs/PITFALLS.md)"; fi
+  elif [ "$sandbox_expected" = 1 ]; then
+    fail "podman" "not installed but the desktop-sandbox is part of this profile: install-linux.sh --sandbox"
+  else
+    note "podman" "not installed (only needed for the desktop-sandbox, --sandbox)"
+  fi
+  # Profiles that write the login-profile block (standard, full, headless) default the sandbox runtime to podman.
+  if [ "$sandbox_expected" = 1 ] || [ "$P_PATH_INTEGRATION" = 1 ]; then
+    if [ -x "$HOME/.local/bin/c101-podman" ]; then pass "podman-wrapper" "~/.local/bin/c101-podman"; else warn_ "podman-wrapper" "missing: rootless uid mapping for the sandbox needs it (re-run install-linux.sh)"; fi
+    if [ -n "${DESKTOP_SANDBOX_RUNTIME:-}" ]; then
+      pass "sandbox-runtime-env" "DESKTOP_SANDBOX_RUNTIME=$DESKTOP_SANDBOX_RUNTIME"
+    else
+      warn_ "sandbox-runtime-env" "DESKTOP_SANDBOX_RUNTIME unset in this shell (log in again after install; c101 would pick docker first)"
+    fi
+  fi
+  if [ "$sandbox_expected" = 1 ]; then
+    if have podman && [ -d "$(podman_storage_dir)" ] && podman image exists c101-desktop-sandbox:2 2>/dev/null; then pass "sandbox-image" "c101-desktop-sandbox:2"; else warn_ "sandbox-image" "image not built: DESKTOP_SANDBOX_RUNTIME=\$HOME/.local/bin/c101-podman ~/.claude/stack/bin/desktop-sandbox --build --profile recommended --base docker.io/library/debian:bookworm-slim"; fi
+  fi
+elif [ "$RUNTIME" = docker ]; then
+  detect_container_runtime docker
+  if [ "$CONTAINER_OK" = 1 ]; then pass "docker" "$CONTAINER_NOTE (fallback runtime)"; else warn_ "docker" "$CONTAINER_NOTE"; fi
+fi
+
+# --- systemd user units --------------------------------------------------------------------------------------------
+units=$(state_get systemd_units 2>/dev/null || true)
+api=$(state_get podman_api_unit 2>/dev/null || true)
+if [ -n "$units" ] || [ "$P_PODMAN_SERVICES" = 1 ]; then
+  if [ "$SYSTEMD_USER_OK" != 1 ]; then
+    warn_ "systemd-user" "no reachable systemd user manager ($INIT_SYSTEM): the Podman API units cannot run; start it by hand: $(manual_api_command)"
+  else
+    unit=${api%% *}
+    if [ -n "$unit" ] && systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+      pass "podman-api-socket" "$unit active"
+    elif [ -n "$unit" ]; then
+      warn_ "podman-api-socket" "$unit is not active: systemctl --user enable --now $unit"
+    fi
+    sock=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock
+    if [ -S "$sock" ]; then pass "podman-socket-path" "$sock"; else note "podman-socket-path" "$sock not created yet (socket activation creates it when enabled)"; fi
+    if [ -n "${DOCKER_HOST:-}" ]; then note "docker-host" "DOCKER_HOST=$DOCKER_HOST"; elif docker_in_use; then note "docker-host" "DOCKER_HOST unset on purpose: a real Docker is in use here (--docker-host-podman to switch)"; else note "docker-host" "DOCKER_HOST unset in this shell (log in again)"; fi
+  fi
+fi
+if [ "$(state_get docker_shim_installed 2>/dev/null || true)" = true ]; then
+  if docker --version 2>/dev/null | grep -qi podman; then pass "docker-shim" "docker -> podman"; else warn_ "docker-shim" "podman-docker was installed but 'docker' is not the shim"; fi
+fi
+
+# --- managed settings ----------------------------------------------------------------------------------------------
+if [ -f "$MANAGED_SETTINGS_FILE" ]; then
+  if helper jsontool.py valid "$MANAGED_SETTINGS_FILE" 2>/dev/null; then pass "managed-settings" "$MANAGED_SETTINGS_FILE"; else fail "managed-settings" "$MANAGED_SETTINGS_FILE is not valid JSON"; fi
+elif [ -n "$(state_get managed_settings 2>/dev/null || true)" ]; then
+  warn_ "managed-settings" "recorded as installed but $MANAGED_SETTINGS_FILE is missing"
+fi
+
+# --- SDK runner (full profile) -------------------------------------------------------------------------------------
+if [ "$PROFILE" = full ] && [ -x "$STACK/bin/stack-sdk" ]; then
+  if out=$(timeout 120 "$STACK/bin/stack-sdk" check 2>&1); then pass "stack-sdk" "stack-sdk check ok"; else warn_ "stack-sdk" "stack-sdk check failed: $(printf '%s' "$out" | tail -n 1)"; fi
+fi
+
+# --- c101's own doctor ---------------------------------------------------------------------------------------------
+if [ "$SKIP_C101" = 0 ] && [ -x "$STACK/bin/stack" ]; then
+  printf '\n--- c101: bin/stack doctor ---\n'
+  if timeout 300 "$STACK/bin/stack" doctor; then
+    pass "c101-doctor" "bin/stack doctor reported no errors"
+  else
+    fail "c101-doctor" "bin/stack doctor exited non-zero (output above)"
+  fi
+fi
+
+printf '\n%d passed, %d warnings, %d failed\n' "$N_PASS" "$N_WARN" "$N_FAIL"
+[ "$N_FAIL" -eq 0 ]

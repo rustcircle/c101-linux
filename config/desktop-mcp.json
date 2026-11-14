@@ -1,0 +1,36 @@
+{
+  "_doc": "Server set for `install-linux.sh --desktop-chat-mcp`: merged into ~/.config/Claude/claude_desktop_config.json under mcpServers. A leading ~ or ${HOME} is expanded to the real home directory at install time. Only stdio servers fit this file (it has no headersHelper), so exa, jina, spider and context7 (HTTP) are not here; add them as connectors in the app. neural-memory is left out on purpose: it has one SQLite writer owned by the delegator agent. No secrets live here: bin/mcp-run reads ~/.claude/stack.env itself. Names are prefixed c101- so they never collide with entries you wrote by hand.",
+  "mcpServers": {
+    "c101-fetch": {
+      "command": "~/.claude/stack/bin/mcp-run",
+      "args": ["uvx", "--python", "3.13", "mcp-server-fetch"]
+    },
+    "c101-playwright": {
+      "command": "~/.claude/stack/bin/mcp-run",
+      "args": [
+        "npx",
+        "-y",
+        "@playwright/mcp@latest",
+        "--headless",
+        "--isolated",
+        "--caps=vision,pdf,devtools",
+        "--output-dir=${HOME}/.claude/stack-data/playwright",
+        "--viewport-size=1280x800"
+      ]
+    },
+    "c101-image": {
+      "command": "~/.claude/stack/bin/mcp-run",
+      "args": ["~/.claude/stack/bin/image-router"]
+    },
+    "c101-desktop-sandbox": {
+      "command": "~/.claude/stack/bin/mcp-run",
+      "args": [
+        "--only",
+        "DESKTOP_SANDBOX_",
+        "env",
+        "CLAUDE_PROJECT_DIR=${HOME}/.claude/stack-data/desktop-chat",
+        "~/.claude/stack/bin/desktop-sandbox"
+      ]
+    }
+  }
+}

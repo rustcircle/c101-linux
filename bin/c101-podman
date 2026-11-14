@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# c101-podman: podman wrapper installed as ~/.local/bin/c101-podman and selected through
+# DESKTOP_SANDBOX_RUNTIME so c101's desktop-sandbox works under ROOTLESS podman without patching c101.
+#
+# c101 starts the sandbox with `--user <host uid>:<host gid>` and a 0700 exchange directory owned by the host
+# user. Rootless podman maps the host uid to container root, so that container user would not own the
+# directory and every file operation would fail. `--userns=keep-id` maps the host uid to itself instead.
+# On SELinux hosts in enforcing mode (Fedora, RHEL) bind mounts also need a label; without a relabel the
+# container gets "permission denied", so label separation is switched off for the sandbox container only
+# (to refuse that and relabel yourself: `echo keep > ~/.config/c101-linux/podman-selinux`, or C101_PODMAN_SELINUX=keep
+# for manual runs; c101 starts this wrapper with a minimal environment, so only the file reaches it). Everything but
+# `run` passes through.
+# c101-linux managed file
+set -euo pipefail
+
+real=""
+self=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+IFS=: read -r -a dirs <<<"${PATH:-/usr/bin:/bin}:/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin:/home/linuxbrew/.linuxbrew/bin:${HOME:-/nonexistent}/.nix-profile/bin"
+for d in "${dirs[@]}"; do
+  c=$d/podman
+  if [ -x "$c" ] && [ "$(readlink -f -- "$c" 2>/dev/null || echo "$c")" != "$self" ]; then
+    real=$c
+    break
+  fi
+done
+[ -n "$real" ] || {
+  echo "c101-podman: podman not found on PATH. Install it (install-linux.sh --sandbox does, with its rootless prerequisites) or use the docker fallback: install-linux.sh --container-runtime docker" >&2
+  exit 127
+}
+
+if [ "${1:-}" = run ]; then
+  shift
+  extra=()
+  if [ "$(id -u)" -ne 0 ]; then extra+=(--userns=keep-id); fi
+  selinux=${C101_PODMAN_SELINUX:-auto}
+  conf=${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/c101-linux/podman-selinux
+  if [ -r "$conf" ]; then selinux=$(head -n 1 "$conf" | tr -d '[:space:]'); fi
+  if [ "$selinux" != keep ] && command -v getenforce >/dev/null 2>&1 &&
+    [ "$(getenforce 2>/dev/null)" = Enforcing ]; then
+    extra+=(--security-opt label=disable)
+  fi
+  exec "$real" run ${extra[@]+"${extra[@]}"} "$@"
+fi
+exec "$real" "$@"

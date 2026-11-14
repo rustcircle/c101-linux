@@ -1,0 +1,12 @@
+# c101-linux managed unit
+[Unit]
+Description=Weekly prune of c101 desktop-sandbox leftovers
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=2h
+Persistent=true
+Unit=c101-podman-prune.service
+
+[Install]
+WantedBy=timers.target

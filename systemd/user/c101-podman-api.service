@@ -1,0 +1,15 @@
+# c101-linux managed unit
+# Socket-activated Podman API service (the Docker-compatible endpoint behind c101-podman-api.socket).
+[Unit]
+Description=Docker-compatible Podman API service (c101-linux fallback)
+Documentation=man:podman-system-service(1)
+Requires=c101-podman-api.socket
+After=c101-podman-api.socket
+
+[Service]
+Type=exec
+# Like the distro's podman.service: containers started through the API get their own cgroup tree under this service.
+Delegate=true
+# --time=0: no idle shutdown, so the first docker-API client does not pay Podman's start-up again.
+ExecStart=/usr/bin/env podman system service --time=0
+KillMode=process

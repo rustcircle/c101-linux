@@ -1,0 +1,12 @@
+# c101-linux managed unit
+[Unit]
+Description=Weekly refresh of the c101 desktop-sandbox image
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=1h
+Persistent=true
+Unit=c101-sandbox-image.service
+
+[Install]
+WantedBy=timers.target

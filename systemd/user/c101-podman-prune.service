@@ -1,0 +1,12 @@
+# c101-linux managed unit
+# Removes ONLY c101's leftovers: stopped desktop-sandbox containers (label dev.c101.desktop-sandbox=1) older than a week
+# and dangling images that carry c101's sandbox label (old builds). Other containers, images, networks and all volumes
+# are never touched. (A bare `podman system prune` would delete every stopped container of yours.)
+[Unit]
+Description=Prune c101 desktop-sandbox leftovers older than one week (never volumes, never other projects' containers)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env podman container prune -f --filter label=dev.c101.desktop-sandbox=1 --filter until=168h
+ExecStart=/usr/bin/env podman image prune -f --filter label=dev.c101.desktop-sandbox.packages
+Nice=19
