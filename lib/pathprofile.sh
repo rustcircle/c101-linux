@@ -76,8 +76,15 @@ _path_safe() { case $1 in *'"'* | *'`'* | *$'\n'*) return 1 ;; esac; return 0; }
 # --- extra exports: container runtime for c101's sandbox and the Docker-compatible Podman API ------------------
 # ENV_SANDBOX_RUNTIME ("" = none): value for DESKTOP_SANDBOX_RUNTIME. A user's own value always wins.
 # ENV_DOCKER_API (0|1): point docker-API clients (docker compose v2, testcontainers, IDEs) at the Podman socket.
+# ENV_PLAYWRIGHT_BROWSER ("" = none): value for PLAYWRIGHT_MCP_BROWSER. Playwright MCP defaults to the Chrome
+#   channel, which most Linux hosts lack (arm64 never has it); chromium is Playwright's own build, installed at
+#   user level by lib/prewarm.sh. A user's own value always wins. Only browser names, never keys, go here (D6).
 ENV_SANDBOX_RUNTIME=""
 ENV_DOCKER_API=0
+ENV_PLAYWRIGHT_BROWSER=chromium
+
+# _pw_browser: ENV_PLAYWRIGHT_BROWSER when it is a plain browser or channel name, else nothing.
+_pw_browser() { case $ENV_PLAYWRIGHT_BROWSER in '' | *[!a-z0-9-]*) return 1 ;; esac; printf '%s\n' "$ENV_PLAYWRIGHT_BROWSER"; }
 
 # _home_literal PATH: leading $HOME replaced by the literal text $HOME (expanded when the profile runs).
 _home_literal() {
@@ -88,6 +95,11 @@ _home_literal() {
 }
 
 extra_env_sh() {
+  local pw
+  if pw=$(_pw_browser); then
+    printf "# Playwright MCP uses Playwright's Chromium, not the Chrome channel Linux rarely has (set your own to override)\n"
+    printf ': "${PLAYWRIGHT_MCP_BROWSER:=%s}"\nexport PLAYWRIGHT_MCP_BROWSER\n' "$pw"
+  fi
   if [ -n "$ENV_SANDBOX_RUNTIME" ]; then
     printf '# c101 desktop-sandbox container runtime (c101 reads it before ~/.claude/stack.env; set your own to override)\n'
     printf ': "${DESKTOP_SANDBOX_RUNTIME:=%s}"\nexport DESKTOP_SANDBOX_RUNTIME\n' "$(_home_literal "$ENV_SANDBOX_RUNTIME")"
@@ -107,6 +119,10 @@ EXTRA_SH_EOF
 }
 
 extra_env_fish() {
+  local pw
+  if pw=$(_pw_browser); then
+    printf 'if not set -q PLAYWRIGHT_MCP_BROWSER\n    set -gx PLAYWRIGHT_MCP_BROWSER "%s"\nend\n' "$pw"
+  fi
   if [ -n "$ENV_SANDBOX_RUNTIME" ]; then
     printf 'if not set -q DESKTOP_SANDBOX_RUNTIME\n    set -gx DESKTOP_SANDBOX_RUNTIME "%s"\nend\n' "$(_home_literal "$ENV_SANDBOX_RUNTIME")"
   fi
@@ -123,6 +139,11 @@ EXTRA_FISH_EOF
 }
 
 extra_env_envd() {
+  local pw
+  if pw=$(_pw_browser); then
+    # environment.d(5) ${VAR:-default}: a value already in the manager's environment wins
+    printf 'PLAYWRIGHT_MCP_BROWSER=${PLAYWRIGHT_MCP_BROWSER:-%s}\n' "$pw"
+  fi
   if [ -n "$ENV_SANDBOX_RUNTIME" ]; then
     local v=$ENV_SANDBOX_RUNTIME
     case $v in "$HOME"/*) v='${HOME}/'"${v#"$HOME"/}" ;; esac

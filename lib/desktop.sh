@@ -192,7 +192,7 @@ GUIDE_EOF
     *)
       printf '    - Use the Claude Code CLI (--install-cli); no Desktop build is known for this system.\n' ;;
   esac
-  printf '    - The Claude Code CLI works everywhere c101 does: ./install-linux.sh --install-cli\n'
+  printf '    - The Claude Code CLI works everywhere c101 does: %s\n' "$(rerun_cmd --install-cli)"
 }
 
 # desktop_prechecks: warnings only; nothing here blocks the install.
@@ -243,20 +243,22 @@ desktop_chat_mcp_apply() {
   [ "$DRY_RUN" = 1 ] && args+=(--dry-run)
   res=$(helper desktop_config.py "${args[@]}") || rc=$?
   if [ "$rc" -eq 3 ]; then
-    warn "Claude Desktop is running; it rewrites its config on exit. Quit it and re-run with --desktop-chat-mcp (or add --force)."
-    next_step "Quit Claude Desktop, then re-run: ./install-linux.sh --desktop-chat-mcp"
+    warn "Claude Desktop is running; it rewrites its config on exit. Quit it and re-run $(rerun_cmd --desktop-chat-mcp) (or add --force)."
+    next_step "Quit Claude Desktop, then re-run: $(rerun_cmd --desktop-chat-mcp)"
     return 0
   elif [ "$rc" -ne 0 ]; then
     err "could not merge into $cfg (exit $rc); the file was left untouched"
     return 1
   fi
-  info "added: $(json_field "$res" added) unchanged: $(json_field "$res" unchanged) conflicts: $(json_field "$res" conflicts)"
+  info "added: $(json_field "$res" added) updated: $(json_field "$res" updated) unchanged: $(json_field "$res" unchanged) conflicts: $(json_field "$res" conflicts)"
+  # updated = an entry an earlier overlay release shipped, upgraded in place (e.g. c101-playwright gains --browser chromium)
   [ -n "$(json_field "$res" backup)" ] && info "backup: $(json_field "$res" backup)"
   if [ "$DRY_RUN" != 1 ]; then
     state_set desktop_config_path "$(json_str "$cfg")"
     local names n
     find_helper_python
-    names=$("${C101L_PY_CMD[@]}" -I -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])["added"]))' "$res")
+    # added and updated entries are both ours now; the uninstaller removes exactly these names (append dedupes)
+    names=$("${C101L_PY_CMD[@]}" -I -c 'import json,sys; r=json.loads(sys.argv[1]); print("\n".join(r.get("added", []) + r.get("updated", [])))' "$res")
     while IFS= read -r n; do
       [ -n "$n" ] && state_append desktop_added_names "$(json_str "$n")"
     done <<<"$names"

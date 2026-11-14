@@ -68,9 +68,9 @@ docker_host_decision() {
     *)
       ENV_DOCKER_API=0
       if [ "${SYSTEMD_USER_OK:-0}" != 1 ]; then
-        next_step "No systemd user manager, so DOCKER_HOST was not exported. After starting the Podman API by hand, export DOCKER_HOST=unix://\$XDG_RUNTIME_DIR/podman/podman.sock or re-run with --docker-host-podman"
+        next_step "No systemd user manager, so DOCKER_HOST was not exported. After starting the Podman API by hand, export DOCKER_HOST=unix://\$XDG_RUNTIME_DIR/podman/podman.sock or re-run $(rerun_cmd --docker-host-podman)"
       elif docker_in_use; then
-        next_step "A Docker daemon, context or DOCKER_HOST is already in use here, so DOCKER_HOST was NOT pointed at Podman (that would hide your Docker containers). To switch anyway: re-run with --docker-host-podman"
+        next_step "A Docker daemon, context or DOCKER_HOST is already in use here, so DOCKER_HOST was NOT pointed at Podman (that would hide your Docker containers). To switch anyway: re-run $(rerun_cmd --docker-host-podman)"
       else
         ENV_DOCKER_API=1
       fi
@@ -110,7 +110,7 @@ install_podman_services() {
   detect_init
   if [ "$SYSTEMD_USER_OK" != 1 ]; then
     case $INIT_SYSTEM in
-      systemd) warn "systemd is running but 'systemctl --user' is unreachable (no user session: ssh without a login session, su, a container). Run 'loginctl enable-linger $(id -un)' as root, log in again, and re-run with --podman-services." ;;
+      systemd) warn "systemd is running but 'systemctl --user' is unreachable (no user session: ssh without a login session, su, a container). Run 'loginctl enable-linger $(id -un)' as root, log in again, and re-run $(rerun_cmd --podman-services)." ;;
       openrc) warn "OpenRC system: no systemd user units. Docker-compatible API by hand:" ;;
       *) warn "no systemd here (Alpine/OpenRC, Void, WSL without systemd=true, or a container): units skipped. Docker-compatible API by hand:" ;;
     esac

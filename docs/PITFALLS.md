@@ -251,3 +251,251 @@ observed on a machine. File references into c101 are listed in [UPSTREAM.md](UPS
 ### 42. `--dry-run` or the doctor created `~/.local/share/containers`
 * Cause: `podman info` initialises rootless storage on first use.
 * Fix: neither ever calls it unless the storage directory already exists (the installer's real run probes after installing podman). A test with a fake `podman` guards this.
+
+## Keys, fal image generation, MCP start-up and learning
+
+Added with the parity change of 2026-11-14 (keys and `stack.env`, fal, presets, MCP pre-warm, Playwright's Chromium, the
+learning backstop). Every entry is reasoned from the code of both repositories and from primary documentation; none of it
+ran on Linux. Entries marked **verify on Linux** name the check that settles them; the full list is in
+[VERIFICATION.md](VERIFICATION.md) section 5.
+
+### 43. Playwright MCP: "Chromium distribution 'chrome' is not found" (also arm64 and Alpine)
+* Symptom: `browser-operator`, or any agent with the Playwright server, fails at its first browser call with
+  `Chromium distribution 'chrome' is not found` and a hint to install Chrome. On arm64 Linux Google Chrome does not exist at all.
+* Cause: @playwright/mcp uses the Chrome channel unless told otherwise, and c101 starts it without `--browser`
+  (`config/mcp.servers.json:4-15`, UPSTREAM.md 13).
+* Fix: `--playwright-browser` (on in standard, full and headless) installs Playwright's own Chromium as your user, no root:
+  `npx -y playwright-core@<the version @playwright/mcp@latest pins> install --no-shell chromium`, into `~/.cache/ms-playwright`
+  (or `$PLAYWRIGHT_BROWSERS_PATH`, which the server must then see too). It writes `PLAYWRIGHT_MCP_BROWSER=chromium` into the
+  login-profile block and `environment.d` (a value you set yourself wins); `--desktop-chat-mcp` entries pass `--browser chromium`.
+  Quit Desktop completely and log in again. `error while loading shared libraries` is the separate root step `--playwright-deps`
+  (Debian/Ubuntu).
+* Profiles that write no profile files (minimal, ci, `--no-path-integration`) cannot carry the variable; the installer says so.
+  Add `--path-integration`, or export it where Claude starts.
+* `Executable doesn't exist at .../chromium-<revision>/...`: `@playwright/mcp@latest` moved to a newer playwright-core after the
+  install, which wants a newer revision. Re-run `install-linux.sh --playwright-browser`.
+* arm64: Playwright builds Chromium for Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13 (x86-64 and arm64); Ubuntu 20.04 and
+  Debian 11 on arm64 have none. Fedora, Arch and other glibc distributions get a generic build with a "not officially supported"
+  warning, which works when the libraries are present (*unverified*).
+* Alpine/musl, the distro-browser fallback: Playwright's browsers are glibc binaries. Install the distribution's browser
+  (`apk add chromium`), skip the download, and export `PLAYWRIGHT_MCP_EXECUTABLE_PATH=/usr/bin/chromium` next to
+  `PLAYWRIGHT_MCP_BROWSER=chromium` (check the binary name on your release).
+* **Verify on Linux**: whether `environment.d` reaches the stdio MCP servers Desktop starts (`UserManagerEnvironmentTests`), and
+  whether the install command leaves the revision the MCP launches and that it starts (`PlaywrightChromiumTests`), both in
+  `tests/test_linux_runtime.py`. Doctor: `playwright-browser`.
+
+### 44. The first MCP start times out while `uvx` or `npx` downloads
+* Symptom: the first agent that uses `fetch`, `neural-memory` or Playwright reports that the server failed to connect or timed
+  out; a later attempt works.
+* Cause: c101 starts them as `uvx --python 3.13 ...` and `npx -y @playwright/mcp@latest`. The first launch downloads Python 3.13
+  and the package, and Claude Code's start-up timeout runs out first. With c101's per-agent servers this happens in the middle of
+  a task, not at session start.
+* Fix: `--prewarm-mcp` (on in every profile except ci) starts each server once with `--help` under `timeout 300`, stdin from
+  `/dev/null` and without any key variable: fetch and neural-memory always, `@playwright/mcp` with `--playwright-browser`,
+  markitdown when it is in `--mcp`. A failure only warns; without uv the warning names uv. Re-run with `--prewarm-mcp` after
+  clearing `~/.cache/uv` or `~/.npm/_npx`, or after a new `@playwright/mcp` release. Doctor: `mcp-fetch-cache` and
+  `neural-memory-cache` (cache warm or cold). Claude Code's `MCP_TIMEOUT` (milliseconds) raises the start-up timeout
+  (*unverified* for agent-scoped servers). Covered by `tests/test_prewarm.py` (stubs; not yet run).
+
+### 45. `stack.env` is a symlink (dotfiles) or lives on a read-only store
+* Behaviour: `lib/stackenv.py` writes through a link to its real path (temp file in that directory, mode 600, `os.replace`), so a
+  stow or hand-made link survives; the backup lands next to the real file (54). A target in `/nix/store`, on a read-only mount or
+  not writable is refused before any prompt (stackenv exit 4, reason `nix-store`, `read-only-mount`, `not-writable` or
+  `dir-not-writable`), and the installer reports the names it could not set.
+* Fix: make `~/.claude/stack.env` a regular file, or a link to a writable file outside the Nix store, or set `CLAUDE_STACK_ENV`
+  to a writable path. That variable must be in the environment Claude starts with (login profile and `environment.d`), or c101's
+  hooks and launchers read `~/.claude/stack.env` instead; c101's own installer also creates and tightens only that default path
+  (UPSTREAM.md 24).
+* The key step tightens a group- or world-readable file to 600 even when nothing else changes, leaves a file owned by another
+  account alone (warning), and warns by path when the file's directory (or the link's) belongs to another account or is group or
+  world writable: another account could replace the file, and c101's launchers export every name in it (UPSTREAM.md 23).
+
+### 46. Never pass keys on the command line
+* Symptom: a key turns up in `~/.bash_history`, `~/.zsh_history`, a CI log or a screen recording.
+* Cause: `FAL_KEY=... ./install-linux.sh` is saved by the shell's history, and the value sits in the installer's
+  `/proc/<pid>/environ` while it runs (readable by your own user only). No installer option takes a value; values reach
+  `lib/stackenv.py` on stdin only.
+* Fix: the hidden prompt, `./install-linux.sh --keys` on a first install, `./install-linux.sh --keys --keys-only` later (keys
+  and the image backend only; nothing else is re-applied). It asks
+  `FAL_KEY` first, then `EXA_API_KEY`, `JINA_API_KEY`, `SPIDER_API_KEY`, `CONTEXT7_API_KEY` (optional) and the extras, with echo
+  off. For the environment form without a history entry, start the line with a space (bash: `HISTCONTROL=ignorespace` or
+  `ignoreboth`; zsh: `setopt HIST_IGNORE_SPACE`), type the key at the silent `read`, and unset it afterwards. The line below
+  is for a first install (a full install); later runs use `./install-linux.sh --keys-only --keys-from-env` instead, which
+  touches the keys and the image backend only and never re-applies the profile's defaults over your earlier choices:
+  ```sh
+   read -rs FAL_KEY && export FAL_KEY && ./install-linux.sh --keys-from-env; unset FAL_KEY
+  ```
+  In CI, map the secret store's variables to the environment and use `--keys-from-env` (the ci profile never prompts).
+* The installer un-exports every key variable on its first line and unsets them after the key step, so c101's installer, the
+  pre-warm and the Chromium download never inherit them. Do not put keys into `environment.d`, the login profile, systemd units,
+  `claude_desktop_config.json` or `settings.json` yourself: at run time the servers read keys from `stack.env` only (56).
+
+### 47. Image tools are missing until URL, KEY and MODEL are set for an operation
+* Symptom: the `image` server is connected but `image-generator` has no `image_generate` (or another operation's tool);
+  `image_ops_status` says `NOT CONFIGURED (missing IMAGE_GEN_KEY)`.
+* Cause: c101's image router lists an operation's tool only while its `IMAGE_<OP>_URL`, `_MODEL` and `_KEY` are all non-empty
+  (`stack_mcp/image_router/config.py:373-384`; the local TRACE and UPSCALE modes and the agent-edited VECTOR_MANIPULATION are the
+  exceptions). Without a fal key the installer still writes the fal preset's URL and MODEL lines with empty KEY values, on
+  purpose, warns once by name (`FAL_KEY`) and prints `install-linux.sh --keys --keys-only`; on ci and `--yes` runs the same warning also
+  gives the unattended form (export `FAL_KEY`, then `install-linux.sh --keys-only --keys-from-env`).
+* Fix: add the key (`./install-linux.sh --keys --keys-only`). Check per operation, names and hosts only:
+  `~/.claude/stack/bin/image-router --check` (to stderr) or `bin/c101-linux-doctor` (`keys-image`, `image-router`, `image-deps`).
+  The router re-reads `stack.env` on every call and announces tool-list changes, so a restart should not be needed (*unverified*).
+* An operation you set up with another provider is kept whole and reported by name (`kept_ops`); `--keys-overwrite` replaces
+  it with fal, after a backup.
+
+### 48. `FAL_KEY` is not `IMAGE_<OP>_KEY`
+* Two readers: `IMAGE_<OP>_KEY` (nine operations: GEN, REF, EDIT, TRANSPARENT, SEGMENT, BG_REMOVAL, UPSCALE, VECTOR, TRACE) is
+  what c101's image router sends to `queue.fal.run`; `FAL_KEY` is read only by `bin/mcp-headers fal`, for the hosted fal MCP
+  (52). The env file has no variable expansion: `IMAGE_GEN_KEY=${FAL_KEY}` is taken literally (UPSTREAM.md 19).
+* The installer asks for one fal key once and writes it to `FAL_KEY` and to every `IMAGE_<OP>_KEY` whose URL is
+  `https://queue.fal.run` (exact host). After that they are separate lines: changing `FAL_KEY` alone leaves the image router on the
+  old key, and the other way round.
+* Fix: rotate with `./install-linux.sh --keys --keys-only --keys-overwrite` (it prompts for every key, set ones included, and
+  rewrites all fal lines after a mode-600 backup), or edit all ten lines. Without `--keys-overwrite` a different key is reported
+  as kept and only empty fal keys are filled.
+
+### 49. A read-only or root-owned c101 checkout: learned `maxTurns` and `effort` do not stick
+* Symptom: `bin/stack learn report` keeps recommending the same change and the agent files never change;
+  `~/.claude/stack-data/hook-errors.log` or `learn.log` shows permission errors.
+* Cause: c101's learner writes `maxTurns`, `effort` and `autoCompactWindow` into the agent files of the checkout (it follows the
+  `~/.claude/agents` links and edits their target). A checkout in `/nix/store`, a root-owned clone or a read-only mount makes every
+  write fail; the hooks only log it and sessions go on with the old values.
+* Fix: a checkout you own and can write (`--source`, see 18). To stop the attempts, set `auto_apply` to false in c101's
+  `config/learning.json`. Doctor: `learning-writable`. The opposite case, a writable git checkout, is 59.
+
+### 50. Quitting Desktop or logging out skips SessionEnd, which loses learning statistics
+* Symptom: sessions that ended by quitting Claude Desktop, by logging out or by a crash have no line in
+  `~/.claude/stack-data/history.jsonl`; `learn report` counts fewer runs and learned values lag.
+* Cause (*unverified*): c101 writes a session's history row, and with `apply_on: session_end` the learned values, only in
+  `stack learn run`, which only its SessionEnd hook starts (`stack/hooks.py:496-503`). An app quit, or a logout that stops the
+  session scope, may end Claude Code before that hook runs.
+* Fix: `--learn-timer` (on in standard, full and headless). A systemd user timer (every 30 minutes, `Persistent=true`) runs
+  `~/.local/bin/c101-learn-backstop`, which calls `stack learn run --transcript` for transcripts last written between 30 minutes
+  and 3 days ago that no learn run has ingested, at most 20 per run. `learn run` takes c101's `learn.lock` and replaces the
+  session's history line, so racing a real SessionEnd is safe. Log: `journalctl --user -u c101-learn-backstop`; preview:
+  `c101-learn-backstop --dry-run`. Without a systemd user manager the installer prints a cron line instead. Doctor:
+  `learning-timer`.
+* Limits of the design: a session idle for more than 30 minutes but still open is learned early and again later; a machine that
+  stays off for more than 3 days loses those sessions (knobs `C101_LEARN_BACKSTOP_*`, listed in the script's header); a session
+  with no earlier observation file is attributed to the main agent `main` (or the timer's `CLAUDE_STACK_MAIN_AGENT`), so a
+  `bin/claude-stack` (delegator) main thread can be mis-attributed.
+* **Verify on Linux**: `LearningBackstopRuntimeTests` (timer enabled, active and persistent; a session without SessionEnd gets
+  exactly one history row) and the manual `DesktopQuitManualCheck` (steps in the docstring of `tests/test_linux_runtime.py`),
+  which also shows whether SessionEnd does run on a Desktop quit; if it does, the backstop simply finds nothing to do.
+
+### 51. "Missing keys" at the start of every session
+* Symptom: each session starts with `Missing keys in ~/.claude/stack.env: EXA_API_KEY, JINA_API_KEY, SPIDER_API_KEY (those MCP
+  servers run anonymous or fail).`
+* Cause: c101's SessionStart hook checks `expected_keys` in its `config/policy.json` (exa, jina, spider), and an empty value counts
+  as missing. The installer leaves them empty when no value came from the environment or the prompt (`--yes`, no terminal, the ci
+  profile). `FAL_KEY` and the image keys are not in that list, so an empty fal key produces no such line (47).
+* Fix: `./install-linux.sh --keys --keys-only`. Without keys exa and jina still work anonymously with rate limits, spider does not
+  (doctor `keys-research`: WARN for exa and jina, FAIL for spider outside ci, INFO for context7).
+* The line always says `~/.claude/stack.env`, but the hook reads `$CLAUDE_STACK_ENV` when the Claude process has it; a value
+  exported only in an interactive shell does not reach Desktop sessions (45).
+
+### 52. The hosted fal MCP: the `fal-runner` agent or `--mcp-config`, not `bin/stack mcp enable fal`
+* Symptom: c101's hint (`bin/stack mcp enable fal`, `config/stack.env.example:93`) edits `.mcp.json` and `.claude/settings.json`
+  inside the c101 checkout: the server appears only in sessions whose project is that checkout, and `git status` there shows the
+  change (UPSTREAM.md 20). Registering it at user scope instead adds about 60 fal tools to every session.
+* What the overlay installs by default (loaded only on demand; `--no-fal-mcp` opts out):
+  * the agent `fal-runner` (`~/.claude/agents/fal-runner.md`, a link into this overlay). It carries the server inline, so the
+    server connects only while the agent runs. Ask for it by name, for example "use fal-runner to turn this image into a
+    5-second video": fal's model catalog, video, audio, 3D and the image endpoints c101's `image` server does not wrap, and job
+    management. Plain image work goes back to `image-generator`, `image-editor` or `vector-artist`. It starts a paid run without
+    asking only up to USD 0.50 per run, or within the ceiling your request names.
+  * for a whole session, CLI only: `claude --mcp-config ~/.config/c101/fal-mcp.json` (under `$XDG_CONFIG_HOME` when set). Claude
+    Desktop has no such option: use the agent there (whether the Code tab loads `~/.claude/agents` is itself unverified, 15).
+* Key: `FAL_KEY` in `stack.env` (48), sent by c101's `bin/mcp-headers fal`. Both the whole-session file and the
+  agent run that helper from a fixed path (`$HOME/.claude/stack/bin/mcp-headers`), never from the working directory or
+  `$CLAUDE_PROJECT_DIR`: the agent never runs a script from a project directory (the install is always user level; UPSTREAM.md 22).
+* Uninstall removes the agent link and the config only while they are still the installed ones (state file); an edited config is
+  kept with a warning. Doctor: `fal-runner`, `fal-mcp-config`, `fal-mcp-reach` (an HTTPS probe that sends no credentials).
+* Whether fal accepts the key header for tool calls is open: 53.
+
+### 53. fal MCP: key header or OAuth (verify on Linux)
+* Symptom: `fal-runner` lists fal's tools, but a call fails with 401 or 403, or the agent reports that the fal MCP refused auth.
+* Cause (*unverified*): `bin/mcp-headers fal` sends `Authorization: Key <FAL_KEY>`. c101's note on its `fal` entry
+  (`config/mcp.optional.json:8`) says a probe accepted that header for `initialize` and `tools/list`; fal documents OAuth through
+  `https://mcp.fal.ai/mcp-relay` as the official route. Tool calls (`run_model`, job submission) with the key header have not
+  been tried.
+* **Verify on Linux**: no automated test exists (the doctor's probe sends no key on purpose); the manual check is in
+  VERIFICATION.md section 5.
+* Fallback if the header is refused: the OAuth route, which c101 lists as `fal-oauth` (`config/mcp.optional.json:10-13`): an HTTP
+  server with the URL `https://mcp.fal.ai/mcp-relay` and no `headersHelper`. Put that entry into a session config of your own,
+  start `claude --mcp-config <that file>` interactively and sign in through `/mcp`. It needs a browser, so not on headless or ci.
+
+### 54. `stack.env.bak-*` files in a dotfiles git repository
+* Symptom: `git status` in your dotfiles repository lists `stack.env.bak-<UTC stamp>` files, and `git add -A` would commit
+  plain-text keys.
+* Cause: before every merge that changes `stack.env` the installer saves the old bytes as `<real path>.bak-<UTC stamp>` (mode 600)
+  next to the real file. When `~/.claude/stack.env` is a stow or hand-made link into a repository, the backups land in it. Common
+  ignore patterns (`stack.env`, `*.env`, `.env*`, `*.bak`) do not match these names (checked with `git check-ignore` in the
+  security review). Nothing deletes them: the installer prints the new backup's path, how many exist and a hint; the uninstaller
+  keeps and lists them.
+* Fix: add `stack.env.bak-*` (and `stack.env`) to that repository's `.gitignore`, and delete old backups by hand once you no
+  longer need them. If one was pushed, rotate the keys in it; rewriting history afterwards is not enough.
+* chezmoi copies files by default and is not affected; a home-manager link into `/nix/store` is refused (45).
+
+### 55. `--image-backend none` still installs the image packs on minimal and ci
+* Cause: `--image-backend` decides only what goes into `stack.env`. The minimal and ci profiles choose their packs with
+  `PRESET=image` (core, image, graphic-design); `none` only stops fal from adding the image preset on the other profiles.
+* Fix: choose packs on the command line, which replaces the profile's preset, for example
+  `--profile minimal --image-backend none --preset research`, or `--packs core`. `--print-config` shows `PRESET` and `PACKS` before
+  anything changes. `keep` acts as the recorded backend, so after an earlier fal install it still adds the image packs.
+* `none` is sticky: the state records `image_backend=none`, and a later run without `--image-backend` keeps `none` (the
+  profile's fal does not come back, and every printed re-run hint carries `--image-backend none`). Only an explicit
+  `--image-backend fal` re-enables fal. `FAL_KEY` is still asked for while the `fal-runner` agent is installed (`--fal-mcp`,
+  the default), but a key never turns the image backend back on.
+
+### 56. After editing `stack.env`: restart or reconnect, never reinstall
+* At run time the servers take keys only from `~/.claude/stack.env` (or `$CLAUDE_STACK_ENV`); the installer only seeds it. Edit
+  the file directly (the mode stays 600: `stat -c %a ~/.claude/stack.env`) or run `./install-linux.sh --keys --keys-only`.
+  When an edit takes effect, from c101's code (*unverified on Linux*):
+  * the `image` server re-reads the file on every call;
+  * the HTTP servers (exa, jina, spider, context7, fal) run `bin/mcp-headers` on each connection: at the next start of an agent
+    that carries them, or after `/mcp` reconnect for a whole-session server (`--mcp-config`);
+  * stdio servers started through c101's `bin/mcp-run` (fetch, the sandbox) read it at launch: at their next start;
+  * servers in `claude_desktop_config.json` (`--desktop-chat-mcp`): after quitting Desktop completely and starting it again;
+  * the "missing keys" line (51): in the next session.
+* A variable of the same name already in Claude's environment beats the file for servers started through `bin/mcp-run` (c101's
+  rule, unless `STACK_ENV_OVERRIDE=1`): one more reason never to export keys from a profile.
+
+### 57. The key step refuses `stack.env` (`line-breaks`), rewrites its line endings or changes its mode
+* Symptom: the key step warns and sets nothing, naming `line-breaks`; or a CRLF file comes back with LF; or the mode becomes 600.
+* Cause: c101 reads the file with bash (`bin/mcp-run`, `bin/mcp-headers`: lines end at LF only) and with Python (every
+  `str.splitlines()` break). A bare CR, NUL, VT, FF, `\x1c`-`\x1e`, U+0085, U+2028 or U+2029 anywhere in the file, even in a
+  comment, makes them read different values, so `lib/stackenv.py` refuses the file (exit 3, `line-breaks`) without naming a value.
+  A CRLF file (edited on Windows) is rewritten with LF at the next merge, and the backup keeps the original. A file that group or
+  others can read is tightened to 600. A key value containing a control character is dropped by name; the other keys still merge.
+* Fix: find the lines (this prints line numbers and the text before `=`, never a value), remove the character, re-run:
+  ```sh
+  python3 -I -c 'import re,sys
+  d=open(sys.argv[1],"rb").read().replace(b"\r\n",b"\n").decode("utf-8","replace")
+  for n,l in enumerate(d.split("\n"),1):
+      if re.search("[\r\0\v\f\x1c-\x1e\x85\u2028\u2029]",l): print(n,l.split("=",1)[0][:40].strip())' ~/.claude/stack.env
+  ```
+
+### 58. The uninstaller skipped the "c101 reversal"
+* Symptom: `uninstall-linux.sh` warns `c101 reversal (...) skipped: c101's installer would create ~/.claude/stack.env from its
+  template` and prints what to undo by hand.
+* Cause: c101's installer runs its base step on every invocation, undo flags (`--no-main-agent`, `--no-enforce-models`,
+  `--no-python-default`) included, and that step creates `~/.claude/stack.env` from the template when it is missing
+  (UPSTREAM.md 24). The uninstaller never creates or changes the keys file, so with the file gone it does not call c101.
+* Fix: remove the settings it names from `~/.claude/settings.json` (`agent`, `availableModels`, `enforceAvailableModels`,
+  `UV_PYTHON`, `UV_PYTHON_PREFERENCE`), or run c101's installer with the printed flags yourself and delete the recreated template.
+* Also by design: the uninstaller never touches `stack.env` or its backups; it lists them, together with Playwright's browsers
+  (`~/.cache/ms-playwright` or `$PLAYWRIGHT_BROWSERS_PATH`), the uv cache (`uv cache clean ...`) and `~/.npm/_npx`. A state file
+  without a recorded c101 source (only `--keys-only` ran) leaves c101's links and hooks alone.
+
+### 59. `git status` shows modified agent files in c101 (and `agents/fal-runner.md` here)
+* Symptom: `git -C ~/.claude/stack status` lists files under `.claude/agents/` as modified, and `git pull` refuses to overwrite
+  local changes. The same can happen to `agents/fal-runner.md` in this overlay.
+* Cause: c101's learner is on by default (`auto_apply` true, `apply_on` session_end) and rewrites the frontmatter lines
+  `maxTurns:`, `effort:` and `autoCompactWindow:` of agents it has evidence for, following the `~/.claude/agents` links into the
+  checkouts. It also finds `fal-runner` through `~/.claude/agents` and, with no bounds entry for it, tunes it within its default
+  bounds (UPSTREAM.md 21; reasoned from c101's code, not observed).
+* Fix: expected, not damage; `git diff` should show only those three keys. Keep them across an update with `git stash`,
+  `git pull`, `git stash pop`, or freeze an agent with `"learn": false` in its entry of c101's `config/learning.json` (or turn
+  `auto_apply` off, 49).

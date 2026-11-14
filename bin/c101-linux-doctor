@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # shellcheck source-path=SCRIPTDIR/..
-# c101-linux-doctor: read-only health check of the c101 overlay. Prints PASS/WARN/FAIL lines, runs c101's own
-# `bin/stack doctor` last and exits 1 when anything FAILed. Changes nothing.
-# Usage: c101-linux-doctor [--profile NAME] [--skip-c101] [--quiet]
+# c101-linux-doctor: read-only health check of the c101 overlay. Prints PASS/WARN/FAIL/INFO lines in sections, in this
+# order: Image generation (fal), Research servers, MCP runtime, Hooks, Workflows, Agents and skills, Settings, Learning,
+# Platform; then runs c101's own `bin/stack doctor` and exits 1 when anything FAILed. Changes nothing.
+# Keys: stack.env (${CLAUDE_STACK_ENV:-~/.claude/stack.env}) is read ONLY through lib/stackenv.py (check, names, ops:
+# names, statuses and paths, never a value) and c101's `bin/image-router --check` (its stderr is reduced to operation
+# names and statuses). This script never cats, sources or greps that file, and never prints, logs or passes a value.
+# Verdicts that depend on the profile use the one recorded in state (state_get profile) unless --profile is given.
+# Usage: c101-linux-doctor [--profile NAME] [--skip-c101] [--offline] [--quiet]
 # shellcheck disable=SC2088  # a literal ~ in messages is for display
 if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo "c101-linux-doctor needs bash >= 4" >&2
@@ -30,7 +35,14 @@ readonly C101L_ROOT
 . "$C101L_ROOT/lib/pathprofile.sh"
 # shellcheck source=lib/services.sh
 . "$C101L_ROOT/lib/services.sh"
+# shellcheck source=lib/falmcp.sh
+. "$C101L_ROOT/lib/falmcp.sh"
+# shellcheck source=lib/learning.sh
+. "$C101L_ROOT/lib/learning.sh"
+# shellcheck source=lib/prewarm.sh
+. "$C101L_ROOT/lib/prewarm.sh"
 
+# --- output --------------------------------------------------------------------------------------------------------
 N_PASS=0 N_WARN=0 N_FAIL=0
 QUIET=0
 pass() { N_PASS=$((N_PASS + 1)); [ "$QUIET" = 1 ] || printf 'PASS  %-22s %s\n' "$1" "$2"; return 0; }
@@ -38,18 +50,62 @@ warn_() { N_WARN=$((N_WARN + 1)); printf 'WARN  %-22s %s\n' "$1" "$2"; return 0;
 fail() { N_FAIL=$((N_FAIL + 1)); printf 'FAIL  %-22s %s\n' "$1" "$2"; return 0; }
 note() { [ "$QUIET" = 1 ] || printf 'INFO  %-22s %s\n' "$1" "$2"; return 0; }
 
+# verdict SEV ID MESSAGE: one line; SEV is pass | warn | fail | info.
+verdict() {
+  case $1 in
+    pass) pass "$2" "$3" ;;
+    warn) warn_ "$2" "$3" ;;
+    fail) fail "$2" "$3" ;;
+    *) note "$2" "$3" ;;
+  esac
+}
+
+# details SEV "NAME<TAB>TEXT"...: indented lines under the verdict just printed (no prefix, so they are never counted
+# or mistaken for a check). --quiet keeps them only under a WARN or FAIL.
+details() {
+  local sev=$1 l
+  shift
+  if [ "$QUIET" = 1 ] && { [ "$sev" = pass ] || [ "$sev" = info ]; }; then return 0; fi
+  for l in "$@"; do printf '      %-22s %s\n' "${l%%$'\t'*}" "${l#*$'\t'}"; done
+  return 0
+}
+
+section() { [ "$QUIET" = 1 ] || printf '\n== %s ==\n' "$1"; return 0; }
+
+join_list() { # join_list SEP ITEM...
+  local sep=$1 out="" x
+  shift
+  for x in "$@"; do out+="${out:+$sep}$x"; done
+  printf '%s' "$out"
+}
+
+list_or_none() { if [ $# -eq 0 ]; then printf 'none'; else join_list ', ' "$@"; fi; }
+
+# op_word STATUS: stackenv.py's operation status as printed (configured | key empty | not configured).
+op_word() {
+  case $1 in
+    configured) printf 'configured' ;;
+    key-empty) printf 'key empty' ;;
+    *) printf 'not configured' ;;
+  esac
+}
+
 usage() {
   cat <<USAGE_EOF
-Usage: c101-linux-doctor [--profile NAME] [--skip-c101] [--quiet]
+Usage: c101-linux-doctor [--profile NAME] [--skip-c101] [--offline] [--quiet]
   --profile NAME   judge against this profile (default: the one recorded at install time, else standard)
   --skip-c101      do not run c101's own 'bin/stack doctor'
-  --quiet          print only WARN and FAIL lines
+  --offline        skip the network probe of the hosted fal MCP server (reported as INFO)
+  --quiet          print only WARN and FAIL lines (plus their detail lines)
+Sections, in order: Image generation (fal), Research servers, MCP runtime, Hooks, Workflows, Agents and skills,
+Settings, Learning, Platform. Key files are reported by name and status only, never by value.
 Exit code: 0 when nothing FAILed, 1 otherwise.
 USAGE_EOF
 }
 
 PROFILE=""
 SKIP_C101=0
+OFFLINE=0
 while [ $# -gt 0 ]; do
   case $1 in
     --profile)
@@ -58,6 +114,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --skip-c101) SKIP_C101=1 ;;
+    --offline) OFFLINE=1 ;;
     --quiet) QUIET=1 ;;
     -h | --help)
       usage
@@ -76,6 +133,10 @@ if [ "$(uname -s)" != Linux ]; then
   exit 3
 fi
 
+export PATH="$HOME/.local/bin:$PATH"
+# Resolve the helper interpreter once in this shell (no download here), so the many helper calls reuse it.
+helper_python_available || true
+
 if [ -z "$PROFILE" ]; then PROFILE=$(state_get profile 2>/dev/null || true); fi
 : "${PROFILE:=standard}"
 profile_load "$PROFILE"
@@ -90,6 +151,1185 @@ printf 'c101-linux-doctor: profile=%s distro=%s (%s) arch=%s libc=%s\n' "$PROFIL
 # severity helper: FAIL when Desktop is installed (the symptom is user-visible), WARN otherwise
 desktop_sev() { if desktop_installed; then fail "$@"; else warn_ "$@"; fi; }
 
+# Profile-dependent severity (D3, D5): FAIL in minimal, standard, full, headless (and custom profiles), WARN in ci.
+if [ "$PROFILE" = ci ]; then PROF_SEV=warn; else PROF_SEV=fail; fi
+prof_sev() { verdict "$PROF_SEV" "$@"; }
+
+# --- shared probes ---------------------------------------------------------------------------------------------------
+US=$'\x1f' # field separator of the helper probes below (not whitespace, so empty fields survive `read`)
+
+st() { state_get "$1" 2>/dev/null || true; } # st KEY: a state value, empty when absent
+IMG_BACKEND=$(st image_backend)               # fal | none | keep | empty (not recorded)
+FAL_MCP_STATE=$(st fal_mcp)                   # true | false | empty
+LEARN_TIMER_STATE=$(st learn_timer)           # true | false | empty
+# The image verdicts follow the profile only when the recorded backend is fal; otherwise a gap is a WARN.
+if [ "$IMG_BACKEND" = fal ]; then IMG_SEV=$PROF_SEV; else IMG_SEV=warn; fi
+
+HAVE_CLI=0
+HAVE_DESKTOP=0
+if have claude; then HAVE_CLI=1; fi
+if desktop_installed; then HAVE_DESKTOP=1; fi
+
+# The key file, resolved exactly as c101's bin/mcp-run and bin/mcp-headers and lib/keys.sh resolve it.
+ENV_FILE=${CLAUDE_STACK_ENV:-$HOME/.claude/stack.env}
+
+# keys_fix_cmd [WHAT] [BACKEND]: the fix command for a missing key (same shape as lib/keys.sh keys_rerun_hint prints). Every
+# profile gets `install-linux.sh --keys --keys-only` (D14): the user's literal D3 command `install-linux.sh --keys`
+# (hidden prompt, run from a terminal), limited by --keys-only to the keys and image-backend step, so following the fix
+# never re-applies the profile's defaults (FAL_MCP, PRESET, ...) over the recorded choices of the install. ci, which
+# cannot prompt, also gets the unattended form (D13): export WHAT (default: the key), then
+# `install-linux.sh --keys-only --keys-from-env`.
+# D12: a recorded backend other than fal rides along (--image-backend none|keep), so following the hint never turns fal
+# image generation back on. BACKEND (only `fal`, to add fal on purpose) replaces that suffix with --image-backend BACKEND.
+keys_fix_cmd() {
+  local root sfx=""
+  root=$(tilde "$C101L_ROOT")
+  sfx+=$(rerun_profile_sfx)
+  if [ -n "${2:-}" ]; then
+    sfx+=" --image-backend $2"
+  else
+    case $IMG_BACKEND in none | keep) sfx+=" --image-backend $IMG_BACKEND" ;; esac
+  fi
+  if [ "$PROFILE" = ci ]; then
+    printf '%s\n' "$root/install-linux.sh --keys --keys-only$sfx from a terminal (hidden prompt), or unattended: export ${1:-the key} (e.g. from a CI secret; never type a key on the command line), then run $root/install-linux.sh --keys-only --keys-from-env$sfx"
+  else
+    printf '%s\n' "$root/install-linux.sh --keys --keys-only$sfx"
+  fi
+}
+
+# tmo SECONDS CMD...: CMD under coreutils/busybox timeout when it exists.
+tmo() {
+  local s=$1
+  shift
+  if have timeout; then timeout "$s" "$@"; else "$@"; fi
+}
+
+# NOKEYS: `env -u NAME...` prefix that drops every key-shaped variable of this shell from a child's environment, so a
+# check sees what the servers see at runtime: keys from stack.env only (D6). The name set is lib/prewarm.sh's own
+# (_prewarm_secret_name: IMAGE_*, FAL_*, *_API_KEY, *_API_TOKEN). Used for c101's bin/stack (depth, learn report) and
+# bin/image-router, and for the doctor's own uv, uvx and curl children.
+NOKEYS=(env)
+while IFS= read -r _n; do
+  if _prewarm_secret_name "$_n"; then NOKEYS+=(-u "$_n"); fi
+done < <(compgen -e 2>/dev/null || true)
+unset _n
+
+# pyrun CODE ARGS...: run inline stdlib Python with the helper interpreter in isolated mode.
+pyrun() {
+  local code=$1
+  shift
+  find_helper_python
+  "${C101L_PY_CMD[@]}" -I -c "$code" "$@"
+}
+
+# JSON object on stdin -> one line per key: KEY US VALUE, or KEY US FIELD1 US FIELD2... for object values.
+PY_JSON_LINES='import json, sys
+S = "\x1f"
+def s(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, list):
+        return ",".join(s(x) for x in v)
+    return str(v).replace(S, " ").replace("\n", " ")
+try:
+    d = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+for k, v in d.items():
+    if isinstance(v, dict):
+        print(S.join([str(k)] + [s(v.get(f)) for f in sys.argv[1:]]))
+    else:
+        print(str(k) + S + s(v))'
+
+json_lines() { # json_lines JSON [FIELD...]
+  local j=$1
+  shift
+  printf '%s' "$j" | pyrun "$PY_JSON_LINES" "$@"
+}
+
+# Fresh login shell (what Claude Desktop and SSH logins inherit): where uv, uvx and npx resolve, and the two
+# variables the servers care about. Only command paths and those two variables are read; never the whole environment.
+LOGIN_OK=0 LOGIN_UV="" LOGIN_UVX="" LOGIN_NPX="" LOGIN_STACK_ENV="" LOGIN_STACK_ENV_SET=0 LOGIN_PW=""
+login_probe() {
+  local sh_bin=${LOGIN_SHELL_PATH:-/bin/sh} out="" line cur=""
+  case $LOGIN_SHELL in bash | zsh | fish) ;; *) sh_bin=/bin/sh ;; esac
+  out=$(tmo 20 env -i HOME="$HOME" USER="$(id -un)" PATH=/usr/bin:/bin "$sh_bin" -lc \
+    'echo @uv; command -v uv; echo @uvx; command -v uvx; echo @npx; command -v npx; echo @env; printenv CLAUDE_STACK_ENV; echo @pw; printenv PLAYWRIGHT_MCP_BROWSER; echo @end' \
+    </dev/null 2>/dev/null) || true
+  while IFS= read -r line; do
+    case $line in
+      @uv | @uvx | @npx | @env | @pw)
+        cur=$line
+        continue
+        ;;
+      @end)
+        LOGIN_OK=1
+        cur=""
+        continue
+        ;;
+    esac
+    case $cur in
+      @uv) if [ -z "$LOGIN_UV" ] && [ "${line#/}" != "$line" ]; then LOGIN_UV=$line; fi ;;
+      @uvx) if [ -z "$LOGIN_UVX" ] && [ "${line#/}" != "$line" ]; then LOGIN_UVX=$line; fi ;;
+      @npx) if [ -z "$LOGIN_NPX" ] && [ "${line#/}" != "$line" ]; then LOGIN_NPX=$line; fi ;;
+      @env) if [ "$LOGIN_STACK_ENV_SET" = 0 ]; then LOGIN_STACK_ENV=$line LOGIN_STACK_ENV_SET=1; fi ;;
+      @pw) if [ -z "$LOGIN_PW" ]; then LOGIN_PW=$line; fi ;;
+    esac
+  done <<<"$out"
+  return 0
+}
+
+# uvx for the stdio servers: the login PATH first, then the directories c101's bin/mcp-run puts in front of PATH
+# before it execs uvx (so a GUI-started Claude still finds it), then this shell's PATH.
+UVX_BIN="" UVX_WHERE=""
+resolve_uvx() {
+  local d
+  if [ -n "$LOGIN_UVX" ] && [ -x "$LOGIN_UVX" ]; then
+    UVX_BIN=$LOGIN_UVX UVX_WHERE=login
+    return 0
+  fi
+  for d in "$HOME/.local/bin" "$HOME/.nix-profile/bin" "/etc/profiles/per-user/$(id -un)/bin" /run/current-system/sw/bin /nix/var/nix/profiles/default/bin /usr/local/bin; do
+    if [ -x "$d/uvx" ]; then
+      UVX_BIN=$d/uvx UVX_WHERE=mcp-run
+      return 0
+    fi
+  done
+  if have uvx; then
+    UVX_BIN=$(command -v uvx) UVX_WHERE=shell
+  fi
+  return 0
+}
+
+login_probe
+resolve_uvx
+
+# =====================================================================================================================
+# 1. Image generation (fal): the main use of c101. Runs first.
+# =====================================================================================================================
+section "Image generation (fal)"
+
+# stackenv.py check: path, symlink target, mode, owner, writability. Exit 4 only means "cannot be rewritten".
+declare -A SE=()
+SE_RC=0
+read_stack_env_check() {
+  local j k v
+  j=$(helper stackenv.py check --file "$ENV_FILE" 2>/dev/null) || SE_RC=$?
+  while IFS=$US read -r k v; do
+    if [ -n "$k" ]; then SE[$k]=$v; fi
+  done < <(json_lines "$j" 2>/dev/null || true)
+  return 0
+}
+
+check_stack_env() {
+  local shown from="" here there=""
+  shown=$(tilde "$ENV_FILE")
+  if [ -n "${CLAUDE_STACK_ENV:-}" ]; then from=" (from CLAUDE_STACK_ENV)"; fi
+  if [ "${SE[exists]:-}" = true ]; then
+    if [ "${SE[is_symlink]:-}" = true ]; then
+      pass stack-env "$shown$from -> $(tilde "${SE[target]:-?}") (symlink followed; the servers read the target)"
+    else
+      pass stack-env "$shown$from"
+    fi
+  elif [ "${SE[dangling]:-}" = true ]; then
+    prof_sev stack-env "$shown$from is a symlink to a missing file ($(tilde "${SE[target]:-?}")): no server gets a key. Fix: restore the target, or $(keys_fix_cmd "the keys")"
+  elif [ -z "${SE[exists]:-}" ]; then
+    prof_sev stack-env "could not inspect $shown$from (stackenv.py exit $SE_RC)"
+  else
+    prof_sev stack-env "$shown$from is missing: the image and research servers get no key. Fix: $(keys_fix_cmd "the keys")"
+  fi
+  # CLAUDE_STACK_ENV honoured: the servers resolve the file from Claude's own environment, which a GUI or SSH session
+  # inherits from a login shell. A value that differs between this shell and a fresh login shell means two files.
+  if [ "$LOGIN_OK" = 1 ] && { [ "$P_PATH_INTEGRATION" = 1 ] || [ "$HAVE_DESKTOP" = 1 ]; }; then
+    here=${CLAUDE_STACK_ENV:-}
+    if [ "$LOGIN_STACK_ENV_SET" = 1 ]; then there=$LOGIN_STACK_ENV; fi
+    if [ "$here" != "$there" ]; then
+      warn_ stack-env "CLAUDE_STACK_ENV is '${here:-unset}' here but '${there:-unset}' in a fresh $LOGIN_SHELL login shell: Claude started from your desktop or an SSH login reads $(tilde "${there:-$HOME/.claude/stack.env}"). Export the same value in your login profile, or unset it"
+    fi
+  fi
+  return 0
+}
+
+check_stack_env_mode() {
+  local t
+  if [ "${SE[exists]:-}" != true ]; then
+    note stack-env-mode "not checked (no file)"
+    return 0
+  fi
+  t=$(tilde "${SE[target]:-$ENV_FILE}")
+  if [ "${SE[owner_ok]:-}" != true ]; then
+    fail stack-env-mode "$t is not owned by $(id -un): the key file must be yours (sudo chown $(id -un) $t)"
+  elif [ "${SE[mode_ok]:-}" != true ]; then
+    fail stack-env-mode "$t has mode ${SE[mode]:-?}: group or others can read your keys. Fix: chmod 600 $t"
+  else
+    pass stack-env-mode "$t mode ${SE[mode]:-?}, owned by $(id -un)"
+  fi
+  case ${SE[reason]:-} in
+    nix-store | read-only-mount) note stack-env-mode "$t is read-only (${SE[reason]}): the installer cannot add keys to it; edit its source instead" ;;
+    not-writable) note stack-env-mode "$t is not writable for you: the installer cannot add keys to it" ;;
+  esac
+  return 0
+}
+
+# Key names (never values): FAL_KEY for fal, the four research keys. A value equal to the fal preset placeholder
+# counts as empty (stackenv.py --placeholder default).
+declare -A KEYST=()
+KEYS_READ=ok KEYS_ERR=""
+read_key_names() {
+  local j rc=0 k v
+  j=$(helper stackenv.py names --file "$ENV_FILE" --keys FAL_KEY,EXA_API_KEY,JINA_API_KEY,SPIDER_API_KEY,CONTEXT7_API_KEY 2>/dev/null) || rc=$?
+  while IFS=$US read -r k v; do
+    if [ -n "$k" ]; then KEYST[$k]=$v; fi
+  done < <(json_lines "$j" 2>/dev/null || true)
+  if [ "$rc" != 0 ] || [ -z "${KEYST[FAL_KEY]:-}" ]; then
+    KEYS_READ=error
+    KEYS_ERR=${KEYST[error]:-exit $rc}
+  fi
+  return 0
+}
+
+# Image operations as c101's router judges them (stackenv.py ops): status and provider per operation name.
+CANON_OPS="GEN REF EDIT TRANSPARENT SEGMENT BG_REMOVAL UPSCALE VECTOR TRACE VECTOR_MANIPULATION"
+OPS_ORDER=()
+declare -A OPS_ST=() OPS_PROV=() OPS_ISS=()
+OPS_RC=0
+read_ops() {
+  local j op s p i
+  local -a ops_arg=() seen=()
+  if [ -f "$STACK/config/image-ops.json" ]; then ops_arg=(--ops-file "$STACK/config/image-ops.json"); fi
+  j=$(helper stackenv.py ops --file "$ENV_FILE" ${ops_arg[@]+"${ops_arg[@]}"} 2>/dev/null) || OPS_RC=$?
+  while IFS=$US read -r op s p i; do
+    if [ -z "$op" ] || [ "$op" = error ]; then continue; fi
+    OPS_ST[$op]=$s OPS_PROV[$op]=$p OPS_ISS[$op]=$i
+    seen+=("$op")
+  done < <(json_lines "$j" status provider issues 2>/dev/null || true)
+  for op in $CANON_OPS; do
+    if [ -n "${OPS_ST[$op]+x}" ]; then OPS_ORDER+=("$op"); fi
+  done
+  for op in ${seen[@]+"${seen[@]}"}; do
+    case " $CANON_OPS " in *" $op "*) ;; *) OPS_ORDER+=("$op") ;; esac
+  done
+  if [ "${#OPS_ORDER[@]}" -eq 0 ] && [ "$OPS_RC" = 0 ]; then OPS_RC=1; fi
+  return 0
+}
+
+check_keys_image() {
+  local op s p i label sev msg fal_st=${KEYST[FAL_KEY]:-absent}
+  local -a lines=() conf=() kempty=() fal_kempty=() probs=()
+  if [ "$KEYS_READ" != ok ] || [ "$OPS_RC" != 0 ]; then
+    verdict "$IMG_SEV" keys-image "cannot read key names from $(tilde "$ENV_FILE") (stackenv.py: ${KEYS_ERR:-exit $OPS_RC}): no image operation can get a key"
+    return 0
+  fi
+  for op in "${OPS_ORDER[@]}"; do
+    s=${OPS_ST[$op]} p=${OPS_PROV[$op]} i=${OPS_ISS[$op]}
+    case $s in
+      configured)
+        conf+=("$op")
+        label="configured"
+        ;;
+      key-empty)
+        kempty+=("$op")
+        label="key empty"
+        if [ "$p" = fal ]; then fal_kempty+=("$op"); fi
+        ;;
+      *) label="not configured" ;;
+    esac
+    if [ "$p" != none ]; then label+=" ($p)"; fi
+    if [ -n "$i" ]; then label+=" [${i//,/, }]"; fi
+    lines+=("$op"$'\t'"$label")
+  done
+  case $IMG_BACKEND in
+    fal)
+      if [ "$fal_st" != set ]; then probs+=("FAL_KEY is $fal_st"); fi
+      if [ "${#fal_kempty[@]}" -gt 0 ]; then probs+=("${#fal_kempty[@]} fal operation(s) have an empty key: $(join_list ', ' "${fal_kempty[@]}")"); fi
+      if [ "${OPS_ST[GEN]:-}" != configured ]; then probs+=("GEN (text-to-image) is $(op_word "${OPS_ST[GEN]:-}")"); fi
+      if [ "${#probs[@]}" -gt 0 ]; then
+        sev=$IMG_SEV
+        msg="backend fal: $(join_list '; ' "${probs[@]}"); those image tools stay hidden until the key is in stack.env. Fix: $(keys_fix_cmd FAL_KEY)"
+      else
+        sev=pass
+        msg="backend fal: FAL_KEY set; configured: $(join_list ', ' "${conf[@]}")"
+      fi
+      ;;
+    none)
+      sev=info
+      msg="backend none (fal opted out with --image-backend none); configured: $(list_or_none ${conf[@]+"${conf[@]}"})"
+      ;;
+    *)
+      if [ "${#kempty[@]}" -gt 0 ]; then
+        sev=warn
+        msg="backend ${IMG_BACKEND:-not recorded}: $(join_list ', ' "${kempty[@]}") have URL and MODEL but an empty key. Fix: $(keys_fix_cmd)"
+      elif [ "${#conf[@]}" -gt 0 ]; then
+        sev=pass
+        msg="backend ${IMG_BACKEND:-not recorded}: configured: $(join_list ', ' "${conf[@]}")"
+      else
+        sev=info
+        # D14: the keys and image-backend step only, so adding fal re-applies no other profile default
+        msg="backend ${IMG_BACKEND:-not recorded}: no image operation configured. Add fal: $(keys_fix_cmd FAL_KEY fal)"
+      fi
+      ;;
+  esac
+  verdict "$sev" keys-image "$msg"
+  details "$sev" ${lines[@]+"${lines[@]}"}
+  return 0
+}
+
+# c101's own view: bin/image-router --check prints its per-operation status to stderr. Only the operation names, a
+# status word and the api name are taken from it; hosts, models and reasons are dropped, and the raw text is never
+# printed. Key variables of this shell are removed from its environment, so it reads stack.env as the server does.
+check_image_router() {
+  local ir=$STACK/bin/image-router out rc=0 line op rest api n=0 gen_ok=0 env_seen="" sev msg
+  local -a conf=() notconf=() agent=() lines=()
+  if [ ! -x "$ir" ]; then
+    verdict "$IMG_SEV" image-router "$(tilde "$ir") not found: c101 is not linked (see stack-link), so there is no image server"
+    return 0
+  fi
+  out=$(tmo 60 "${NOKEYS[@]}" "$ir" --check 2>&1 >/dev/null </dev/null) || rc=$?
+  if [ "$rc" != 0 ]; then
+    msg="image-router --check failed (exit $rc)"
+    if [ "$rc" = 124 ]; then msg+=", timed out after 60 s"; fi
+    verdict "$IMG_SEV" image-router "$msg: the image server would not start. Fix: re-run $(rerun_cmd) (c101's uv environment)"
+    return 0
+  fi
+  while IFS= read -r line; do
+    if [[ $line =~ ^env\ file:\ .*\((found|missing)\)$ ]]; then
+      env_seen=${BASH_REMATCH[1]}
+    elif [[ $line =~ ^[[:space:]]+([A-Z][A-Z0-9_]*)[[:space:]]+(.*)$ ]]; then
+      op=${BASH_REMATCH[1]} rest=${BASH_REMATCH[2]}
+      n=$((n + 1))
+      case $rest in
+        'NOT CONFIGURED'*) notconf+=("$op") ;;
+        claude*) agent+=("$op") ;;
+        *)
+          api=${rest%% *}
+          case $api in
+            fal | openrouter | opper | openai | local) conf+=("$op ($api)") ;;
+            *) conf+=("$op") ;;
+          esac
+          if [ "$op" = GEN ]; then gen_ok=1; fi
+          ;;
+      esac
+    fi
+  done <<<"$out"
+  if [ "$n" = 0 ]; then
+    verdict "$IMG_SEV" image-router "image-router --check listed no operation: the image server is not working. Fix: re-run $(rerun_cmd)"
+    return 0
+  fi
+  if [ "${#conf[@]}" -gt 0 ]; then lines+=("configured"$'\t'"$(join_list ', ' "${conf[@]}")"); fi
+  if [ "${#notconf[@]}" -gt 0 ]; then lines+=("not configured"$'\t'"$(join_list ', ' "${notconf[@]}")"); fi
+  if [ "${#agent[@]}" -gt 0 ]; then lines+=("agent-handled"$'\t'"$(join_list ', ' "${agent[@]}") (the agent edits SVG)"); fi
+  msg="${#conf[@]} of $n operations configured as the server sees them${env_seen:+ (key file $env_seen)}"
+  if [ "$IMG_BACKEND" = fal ] && [ "$gen_ok" = 0 ]; then
+    sev=$IMG_SEV
+    msg+="; GEN is not configured, so the image server offers no text-to-image tool. Fix: $(keys_fix_cmd FAL_KEY)"
+  elif [ "${#conf[@]}" -eq 0 ]; then
+    sev=info
+    msg+="; no image tool is offered (image_backend=${IMG_BACKEND:-not recorded})"
+  else
+    sev=pass
+  fi
+  verdict "$sev" image-router "$msg"
+  details "$sev" ${lines[@]+"${lines[@]}"}
+  return 0
+}
+
+PY_IMPORTS='import importlib
+bad = []
+for m in ("PIL", "vtracer", "resvg_py", "pikepdf"):
+    try:
+        importlib.import_module(m)
+    except Exception:
+        bad.append(m)
+print(",".join(bad))'
+
+check_image_deps() {
+  local py=$STACK/.venv/bin/python bad rc=0
+  if [ ! -x "$py" ]; then
+    if [ -x "$HOME/.local/bin/uv" ] || [ -n "$LOGIN_UV" ] || have uv; then
+      warn_ image-deps "no $(tilde "$py"): the image server builds c101's environment with uv on its first start, which can outlast the MCP start-up timeout. Fix: re-run $(rerun_cmd)"
+    else
+      verdict "$IMG_SEV" image-deps "no $(tilde "$py") and no uv: the image server cannot start. Fix: re-run $(rerun_cmd) (it installs uv)"
+    fi
+    return 0
+  fi
+  bad=$(tmo 60 "$py" -I -c "$PY_IMPORTS" </dev/null 2>/dev/null) || rc=$?
+  if [ "$rc" != 0 ]; then
+    verdict "$IMG_SEV" image-deps "$(tilde "$py") does not run (exit $rc): c101's environment is broken. Fix: re-run $(rerun_cmd)"
+  elif [ -z "$bad" ]; then
+    pass image-deps "PIL, vtracer, resvg_py and pikepdf import in c101's .venv"
+  elif [[ ,$bad, == *,PIL,* ]]; then
+    verdict "$IMG_SEV" image-deps "missing in c101's .venv: ${bad//,/, } (PIL handles every generated image). Fix: re-run $(rerun_cmd) (uv sync)"
+  else
+    warn_ image-deps "missing in c101's .venv: ${bad//,/, } (local SVG, trace and layered PDF tools fail). Fix: re-run $(rerun_cmd) (uv sync)"
+  fi
+  return 0
+}
+
+# Hosted fal MCP (D8): the overlay agent fal-runner carries it; its headersHelper reads FAL_KEY from stack.env.
+check_fal_runner() {
+  local agent fal_st=${KEYST[FAL_KEY]:-absent}
+  agent=$(fal_agent_dest)
+  if [ "$FAL_MCP_STATE" = true ]; then
+    if [ -e "$agent" ] && fal_agent_is_ours "$agent"; then
+      if [ ! -x "$STACK/bin/mcp-headers" ]; then
+        fail fal-runner "$(tilde "$agent") linked, but its headersHelper ~/.claude/stack/bin/mcp-headers is missing (see stack-link): the fal MCP connects without a key"
+      elif [ "$KEYS_READ" != ok ]; then
+        warn_ fal-runner "$(tilde "$agent") linked; FAL_KEY status unknown (stack.env unreadable)"
+      elif [ "$fal_st" != set ]; then
+        warn_ fal-runner "$(tilde "$agent") linked, but FAL_KEY is $fal_st in stack.env: the fal MCP gets no key. Fix: $(keys_fix_cmd FAL_KEY)"
+      else
+        pass fal-runner "$(tilde "$agent") linked; FAL_KEY set (read from stack.env only while the agent runs)"
+      fi
+    elif [ -L "$agent" ] && fal_agent_is_ours "$agent"; then
+      fail fal-runner "$(tilde "$agent") is a dangling link (the overlay checkout moved?). Fix: re-run $(rerun_cmd)"
+    else
+      fail fal-runner "state fal_mcp=true but $(tilde "$agent") is missing or not ours. Fix: re-run $(rerun_cmd) (or --no-fal-mcp to opt out)"
+    fi
+  elif [ -e "$agent" ] && fal_agent_is_ours "$agent"; then
+    note fal-runner "$(tilde "$agent") linked (state fal_mcp=${FAL_MCP_STATE:-not recorded})"
+  else
+    note fal-runner "fal-runner agent not installed (state fal_mcp=${FAL_MCP_STATE:-not recorded}; every profile installs it unless --no-fal-mcp)"
+  fi
+  return 0
+}
+
+check_fal_mcp_config() {
+  local cfg shown
+  cfg=$(fal_mcp_config_path)
+  shown=$(tilde "$cfg")
+  if [ "$FAL_MCP_STATE" = true ]; then
+    if [ ! -e "$cfg" ] && [ ! -L "$cfg" ]; then
+      warn_ fal-mcp-config "$shown missing: the whole-session route (claude --mcp-config FILE) is unavailable; the fal-runner agent still works. Fix: re-run $(rerun_cmd)"
+    elif fal_config_is_ours "$cfg"; then
+      pass fal-mcp-config "$shown present (whole session: claude --mcp-config $shown)"
+    else
+      warn_ fal-mcp-config "$shown differs from the config this overlay installed (edited, or not ours); shipped version: $(tilde "$C101L_ROOT")/config/fal-mcp.json"
+    fi
+  elif [ -e "$cfg" ]; then
+    note fal-mcp-config "$shown present (state fal_mcp=${FAL_MCP_STATE:-not recorded})"
+  else
+    note fal-mcp-config "not installed (state fal_mcp=${FAL_MCP_STATE:-not recorded})"
+  fi
+  return 0
+}
+
+# Reachability of the hosted fal MCP endpoint. The request carries NO credentials and no custom header: `-q` first
+# so no ~/.curlrc can add any, no netrc option, no redirect following. Any HTTP status (401 included) means reachable.
+check_fal_mcp_reach() {
+  local code=""
+  if [ "$FAL_MCP_STATE" != true ]; then
+    note fal-mcp-reach "not probed (fal MCP agent not installed)"
+  elif [ "$OFFLINE" = 1 ]; then
+    note fal-mcp-reach "not probed (--offline)"
+  elif ! have curl; then
+    note fal-mcp-reach "not probed (curl is not installed)"
+  else
+    code=$(tmo 15 "${NOKEYS[@]}" curl -q --silent --show-error --output /dev/null --write-out '%{http_code}' \
+      --connect-timeout 5 --max-time 10 --proto '=https' "$FAL_MCP_URL" </dev/null 2>/dev/null) || true
+    case $code in
+      [1-5][0-9][0-9]) pass fal-mcp-reach "$FAL_MCP_URL reachable over HTTPS (HTTP $code to a request without credentials)" ;;
+      *) note fal-mcp-reach "$FAL_MCP_URL not reachable from here (offline, DNS or a proxy); the fal MCP needs HTTPS to mcp.fal.ai" ;;
+    esac
+  fi
+  return 0
+}
+
+read_stack_env_check
+read_key_names
+read_ops
+check_stack_env
+check_stack_env_mode
+check_keys_image
+check_image_router
+check_image_deps
+check_fal_runner
+check_fal_mcp_config
+check_fal_mcp_reach
+
+# =====================================================================================================================
+# 2. Research servers: exa, jina, spider, context7 (HTTP, keys as headers from stack.env via bin/mcp-headers) and fetch
+#    (stdio through bin/mcp-run uvx). Registered in every profile.
+# =====================================================================================================================
+section "Research servers"
+
+check_keys_research() {
+  local s srv name
+  if [ "$KEYS_READ" != ok ]; then
+    prof_sev keys-research "cannot read key names from $(tilde "$ENV_FILE") (stackenv.py: $KEYS_ERR): exa, jina, spider and context7 get no key"
+    return 0
+  fi
+  for srv in exa jina; do
+    if [ "$srv" = exa ]; then name=EXA_API_KEY; else name=JINA_API_KEY; fi
+    s=${KEYST[$name]:-absent}
+    if [ "$s" = set ]; then
+      pass keys-research "$srv: $name set"
+    else
+      warn_ keys-research "$srv: $name is $s: $srv still works anonymously, with rate limits. Add a key: $(keys_fix_cmd "$name")"
+    fi
+  done
+  s=${KEYST[SPIDER_API_KEY]:-absent}
+  if [ "$s" = set ]; then
+    pass keys-research "spider: SPIDER_API_KEY set"
+  else
+    prof_sev keys-research "spider: SPIDER_API_KEY is $s: spider requires a key, so its crawl and scrape tools fail. Fix: $(keys_fix_cmd SPIDER_API_KEY)"
+  fi
+  s=${KEYST[CONTEXT7_API_KEY]:-absent}
+  if [ "$s" = set ]; then
+    pass keys-research "context7: CONTEXT7_API_KEY set"
+  else
+    note keys-research "context7: CONTEXT7_API_KEY is $s (optional: context7 connects without a key at lower limits)"
+  fi
+  if [ ! -x "$STACK/bin/mcp-headers" ]; then
+    warn_ keys-research "~/.claude/stack/bin/mcp-headers missing (see stack-link): exa, jina, spider and context7 connect without their key headers"
+  fi
+  return 0
+}
+
+# fetch: uvx must resolve where Claude launches it, and its package should already be in uv's cache (pre-warm), or
+# the first start downloads it and can outlast the MCP start-up timeout.
+check_fetch() {
+  local where cache rc=0
+  if [ -z "$UVX_BIN" ]; then
+    prof_sev mcp-fetch-cache "uvx not found (login PATH, bin/mcp-run's directories, this shell): the fetch server cannot start. Fix: re-run $(rerun_cmd) (it installs uv)"
+    return 0
+  fi
+  tmo 60 "${NOKEYS[@]}" "$UVX_BIN" --offline --python 3.13 mcp-server-fetch --help </dev/null >/dev/null 2>&1 || rc=$?
+  if [ "$rc" = 0 ]; then cache="cache warm (mcp-server-fetch is in uv's cache)"; else cache="cache cold"; fi
+  case $UVX_WHERE in
+    login) where="uvx on the login PATH ($LOGIN_UVX)" ;;
+    mcp-run) where="uvx at $(tilde "$UVX_BIN") (not on the login PATH, but c101's bin/mcp-run puts its directory first)" ;;
+    *)
+      where=""
+      if [ "$P_PATH_INTEGRATION" != 1 ] && [ "$HAVE_DESKTOP" = 0 ]; then
+        where="uvx on this shell's PATH ($(tilde "$UVX_BIN"); profile $PROFILE starts Claude from a shell, not a desktop session)"
+      fi
+      ;;
+  esac
+  if [ -n "$where" ]; then
+    pass mcp-fetch-cache "fetch: $where; $cache"
+  else
+    desktop_sev mcp-fetch-cache "fetch: uvx only on this shell's PATH ($(tilde "$UVX_BIN")): Claude started from your desktop session will not find it; $cache. Fix: re-run $(rerun_cmd) (login-profile PATH block)"
+  fi
+  if [ "$rc" != 0 ]; then
+    note mcp-fetch-cache "the first fetch start downloads mcp-server-fetch and may hit the MCP start-up timeout. Pre-warm: $(rerun_cmd --prewarm-mcp)"
+  fi
+  return 0
+}
+
+check_keys_research
+check_fetch
+
+# =====================================================================================================================
+# 3. MCP runtime: Playwright's browser and the neural-memory server cache.
+# =====================================================================================================================
+section "MCP runtime"
+
+check_playwright_browser() {
+  local pw_dir d chromium="" envsrc="" val probs=()
+  pw_dir=${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}
+  for d in "$pw_dir"/chromium-*; do
+    if [ -d "$d" ]; then chromium=$d; fi
+  done
+  if [ -n "$LOGIN_PW" ]; then
+    val=$LOGIN_PW
+    case $val in '' | *[!a-z0-9-]*) val="set" ;; esac
+    envsrc="login shell (PLAYWRIGHT_MCP_BROWSER=$val)"
+  elif [ -f "$(envd_file)" ] && grep -q '^PLAYWRIGHT_MCP_BROWSER=' "$(envd_file)" 2>/dev/null; then
+    envsrc="$(tilde "$(envd_file)")"
+  elif [ -n "${PLAYWRIGHT_MCP_BROWSER:-}" ]; then
+    envsrc="this shell only"
+  fi
+  if [ "${LIBC:-}" = musl ]; then
+    note playwright-browser "musl: Playwright ships no Chromium for this libc (see docs/PITFALLS.md for the distro-browser fallback)"
+    return 0
+  fi
+  if [ -z "$chromium" ]; then probs+=("no Chromium under $(tilde "$pw_dir")"); fi
+  if [ -z "$envsrc" ]; then probs+=("PLAYWRIGHT_MCP_BROWSER is not set for Claude (login profile or environment.d)"); fi
+  if [ "${#probs[@]}" -eq 0 ]; then
+    pass playwright-browser "Chromium in $(tilde "$chromium"); PLAYWRIGHT_MCP_BROWSER from $envsrc"
+  elif [ "${P_PLAYWRIGHT_BROWSER:-0}" = 1 ]; then
+    warn_ playwright-browser "$(join_list '; ' "${probs[@]}"): Playwright MCP cannot start a browser. Fix: $(rerun_cmd --playwright-browser)"
+  else
+    note playwright-browser "not set up ($(join_list '; ' "${probs[@]}")); --playwright-browser adds it"
+  fi
+  return 0
+}
+
+check_neural_memory_cache() {
+  local nmv rc=0
+  if ! nmv=$(prewarm_nm_version); then
+    note neural-memory-cache "no NM_VERSION in ~/.claude/stack/bin/neural-memory-mcp: not checked"
+    return 0
+  fi
+  if [ -z "$UVX_BIN" ]; then
+    note neural-memory-cache "uvx not found: not checked (see mcp-fetch-cache)"
+    return 0
+  fi
+  tmo 60 "${NOKEYS[@]}" "$UVX_BIN" --offline --python 3.13 --from "neural-memory==$nmv" nmem-mcp --help </dev/null >/dev/null 2>&1 || rc=$?
+  if [ "$rc" = 0 ]; then
+    pass neural-memory-cache "neural-memory $nmv is in uv's cache"
+  else
+    note neural-memory-cache "neural-memory $nmv not cached: its first start downloads it (pre-warm: --prewarm-mcp)"
+  fi
+  return 0
+}
+
+check_playwright_browser
+check_neural_memory_cache
+
+# =====================================================================================================================
+# 4. Hooks
+# =====================================================================================================================
+section "Hooks"
+
+SETTINGS=$HOME/.claude/settings.json
+# RV1 R5: the flags c101's installer actually ran with (state c101_flags, written by c101_run) decide what is expected;
+# the profile's flags stand in only when nothing was recorded (an install --profile full --no-enforce-models recorded
+# no --enforce-models, so no PreModelSwitch hook and no availableModels are expected).
+C101_FLAGS_RECORDED=0 C101_FLAGS_STATE=""
+if C101_FLAGS_STATE=$(state_get c101_flags 2>/dev/null); then C101_FLAGS_RECORDED=1; else C101_FLAGS_STATE=""; fi
+c101_flag_installed() { # c101_flag_installed FLAG: in the recorded c101_flags, else in the profile's flags
+  local t
+  if [ "$C101_FLAGS_RECORDED" != 1 ]; then
+    flag_has "$1"
+    return
+  fi
+  for t in $C101_FLAGS_STATE; do [ "$t" = "$1" ] && return 0; done
+  return 1
+}
+ENFORCE=0
+if c101_flag_installed --enforce-models; then ENFORCE=1; fi
+
+# c101's .claude/settings.json against ~/.claude/settings.json: hook events and matchers, and the env names. Prints
+# names, counts and the values of three numeric limits only (never another env value).
+PY_SETTINGS='import json, os, re, sys
+S = "\x1f"
+proj_p, user_p, enforce, mark = sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
+NAMED = ("CLAUDE_STACK_MAX_DEPTH", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS", "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS")
+def load(p):
+    if not os.path.exists(p):
+        return "missing", {}
+    try:
+        with open(p, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return "invalid", {}
+    return ("ok", d) if isinstance(d, dict) else ("invalid", {})
+def obj(d, k):
+    v = d.get(k)
+    return v if isinstance(v, dict) else {}
+def lst(v):
+    return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
+ps, proj = load(proj_p)
+us, user = load(user_p)
+print("proj" + S + ps)
+print("user" + S + us)
+enforce = enforce or user.get("enforceAvailableModels") is True
+proj_re = re.compile(r"bin/stack hook ([A-Za-z0-9_-]+)")
+user_re = re.compile(re.escape(mark) + r" ([A-Za-z0-9_-]+)")
+uhooks = obj(user, "hooks")
+total = present = 0
+missing = []
+for ev, groups in obj(proj, "hooks").items():
+    if ev == "PreModelSwitch" and not enforce:
+        continue
+    for g in lst(groups):
+        m = g.get("matcher") or ""
+        for h in lst(g.get("hooks")):
+            pm = proj_re.search(str(h.get("command") or ""))
+            if not pm:
+                continue
+            total += 1
+            found = False
+            for ug in lst(uhooks.get(ev)):
+                if (ug.get("matcher") or "") != m:
+                    continue
+                for uh in lst(ug.get("hooks")):
+                    um = user_re.search(str(uh.get("command") or ""))
+                    if um and um.group(1) == pm.group(1):
+                        found = True
+            if found:
+                present += 1
+            else:
+                missing.append("%s (hook %s)" % (ev, pm.group(1)))
+print("hooks_total" + S + str(total))
+print("hooks_present" + S + str(present))
+print("hooks_missing" + S + "; ".join(missing))
+penv, uenv = obj(proj, "env"), obj(user, "env")
+want = list(NAMED) + [k for k in penv if k not in NAMED]
+miss = [k for k in want if k not in uenv]
+shown = []
+for k in NAMED:
+    if k in uenv:
+        v = str(uenv[k])
+        shown.append("%s=%s" % (k, v if v.isdigit() else "set"))
+print("env_total" + S + str(len(want)))
+print("env_missing" + S + ", ".join(miss))
+print("env_shown" + S + ", ".join(shown))'
+
+declare -A SJ=()
+read_settings_probe() {
+  local k v
+  while IFS=$US read -r k v; do
+    if [ -n "$k" ]; then SJ[$k]=$v; fi
+  done < <(pyrun "$PY_SETTINGS" "$STACK/.claude/settings.json" "$SETTINGS" "$ENFORCE" "/.claude/stack/bin/stack hook" 2>/dev/null || true)
+  return 0
+}
+
+check_hooks_events() {
+  local h_total=${SJ[hooks_total]:-0} h_present=${SJ[hooks_present]:-0} h_note=""
+  case ${SJ[user]:-missing} in
+    missing)
+      fail hooks-events "$(tilde "$SETTINGS") missing: no c101 hook runs. Fix: re-run $(rerun_cmd)"
+      return 0
+      ;;
+    invalid)
+      fail hooks-events "$(tilde "$SETTINGS") is not valid JSON: no c101 hook runs (backups: settings.json.bak-*)"
+      return 0
+      ;;
+  esac
+  if [ "${SJ[proj]:-missing}" != ok ]; then
+    warn_ hooks-events "c101's ~/.claude/stack/.claude/settings.json is ${SJ[proj]:-missing} (see stack-link): hooks not compared"
+    return 0
+  fi
+  if [ "$ENFORCE" = 0 ]; then h_note=" (PreModelSwitch is expected only with --enforce-models)"; fi
+  if [ "$h_total" = 0 ]; then
+    note hooks-events "c101's settings.json defines no hook"
+  elif [ "$h_present" = "$h_total" ]; then
+    pass hooks-events "all $h_total c101 hook commands present with their events and matchers$h_note"
+  elif [ "$h_present" = 0 ]; then
+    fail hooks-events "none of the $h_total c101 hook commands is in $(tilde "$SETTINGS"): c101 --user did not run. Fix: re-run $(rerun_cmd)"
+  else
+    warn_ hooks-events "$((h_total - h_present)) of $h_total c101 hook commands missing or with another matcher: ${SJ[hooks_missing]:-}. Fix: re-run $(rerun_cmd)"
+  fi
+  return 0
+}
+
+# The hook command is "$HOME"/.claude/stack/bin/stack hook ...; c101's bin/_pyenv.sh runs it on .venv/bin/python,
+# else through uv (it puts ~/.local/bin, /opt/homebrew/bin and /usr/local/bin first), else system python3.
+check_hooks_runtime() {
+  local uv=""
+  if [ ! -x "$STACK/bin/stack" ]; then
+    prof_sev hooks-runtime "~/.claude/stack/bin/stack is not executable: every c101 hook fails (see stack-link)"
+    return 0
+  fi
+  if [ -n "$LOGIN_UV" ]; then
+    uv=$LOGIN_UV
+  elif [ -x "$HOME/.local/bin/uv" ]; then
+    uv=$HOME/.local/bin/uv
+  elif [ -x /usr/local/bin/uv ]; then
+    uv=/usr/local/bin/uv
+  fi
+  if [ -x "$STACK/.venv/bin/python" ]; then
+    pass hooks-runtime "bin/stack runs the hooks on c101's .venv/bin/python"
+  elif [ -n "$uv" ]; then
+    pass hooks-runtime "no .venv: bin/stack runs the hooks through uv ($(tilde "$uv")); slower first call. Restore .venv: re-run $(rerun_cmd)"
+  else
+    warn_ hooks-runtime "neither c101's .venv/bin/python nor uv on the login PATH: the hooks fall back to system python3. Fix: re-run $(rerun_cmd)"
+  fi
+  return 0
+}
+
+read_settings_probe
+check_hooks_events
+check_hooks_runtime
+
+# =====================================================================================================================
+# 5. Workflows
+# =====================================================================================================================
+section "Workflows"
+
+check_workflows_linked() {
+  local src=$STACK/.claude/workflows dst=$HOME/.claude/workflows f b total=0 ok=0
+  local -a wf_missing=() wf_stale=()
+  if [ ! -d "$src" ]; then
+    note workflows-linked "no .claude/workflows in the c101 checkout (see stack-link)"
+    return 0
+  fi
+  for f in "$src"/*.js; do
+    [ -e "$f" ] || continue
+    total=$((total + 1))
+    b=${f##*/}
+    if [ "$dst/$b" -ef "$f" ]; then
+      ok=$((ok + 1))
+    elif [ -e "$dst/$b" ]; then
+      wf_stale+=("$b")
+    else
+      wf_missing+=("$b")
+    fi
+  done
+  if [ "$total" = 0 ]; then
+    note workflows-linked "the c101 checkout has no workflow"
+  elif [ "$ok" = "$total" ]; then
+    pass workflows-linked "all $total c101 workflows resolve in ~/.claude/workflows"
+  elif [ "$ok" = 0 ]; then
+    prof_sev workflows-linked "none of the $total c101 workflows resolves in ~/.claude/workflows: c101 --user did not run. Fix: re-run $(rerun_cmd)"
+  else
+    warn_ workflows-linked "$ok of $total c101 workflows resolve in ~/.claude/workflows${wf_missing[0]:+; missing: $(join_list ', ' "${wf_missing[@]}")}${wf_stale[0]:+; pointing elsewhere: $(join_list ', ' "${wf_stale[@]}")}. Fix: re-run $(rerun_cmd)"
+  fi
+  return 0
+}
+
+check_workflows_linked
+
+# =====================================================================================================================
+# 6. Agents and skills
+# =====================================================================================================================
+section "Agents and skills"
+
+# Expected links for the resolved packs, computed as c101's stack/install.py link_components does (agents under
+# ~/.claude/agents/stack/<rel>.md, skills as ~/.claude/skills/<name>, core and transitive requires always included).
+PY_AGENTS='import json, os, sys
+S = "\x1f"
+repo, packs_json, sel, claude = sys.argv[1:5]
+try:
+    with open(packs_json, encoding="utf-8") as fh:
+        packs = json.load(fh)["packs"]
+    if not isinstance(packs, dict):
+        raise ValueError("packs")
+except (OSError, ValueError, KeyError, TypeError):
+    print("error" + S + "packs.json")
+    sys.exit(0)
+names = [n.strip() for n in sel.replace(" ", ",").split(",") if n.strip()] or ["all"]
+order, unknown = [], []
+def spec(p):
+    v = packs.get(p)
+    return v if isinstance(v, dict) else {}
+def visit(p):
+    if p in order:
+        return
+    if p not in packs:
+        if p not in unknown:
+            unknown.append(p)
+        return
+    order.append(p)
+    for r in spec(p).get("requires") or []:
+        visit(r)
+visit("core")
+for n in names:
+    if n == "all":
+        for q in packs:
+            visit(q)
+    else:
+        visit(n)
+def members(key):
+    return {x for p in order for x in (spec(p).get(key) or []) if isinstance(x, str)}
+want_a, want_s = members("agents"), members("skills")
+src_a = os.path.join(repo, ".claude", "agents")
+exp_a, miss_a = 0, []
+for root, _dirs, files in os.walk(src_a):
+    for f in sorted(files):
+        if f.endswith(".md") and f[:-3] in want_a:
+            exp_a += 1
+            rel = os.path.relpath(os.path.join(root, f), src_a)
+            if not os.path.exists(os.path.join(claude, "agents", "stack", rel)):
+                miss_a.append(f[:-3])
+src_s = os.path.join(repo, ".claude", "skills")
+exp_s, miss_s = 0, []
+if os.path.isdir(src_s):
+    for n in sorted(os.listdir(src_s)):
+        if n in want_s and os.path.isdir(os.path.join(src_s, n)):
+            exp_s += 1
+            if not os.path.exists(os.path.join(claude, "skills", n)):
+                miss_s.append(n)
+dangling = 0
+for root, _dirs, files in os.walk(os.path.join(claude, "agents", "stack")):
+    for f in files + _dirs:
+        p = os.path.join(root, f)
+        if os.path.islink(p) and not os.path.exists(p):
+            dangling += 1
+sk = os.path.join(claude, "skills")
+if os.path.isdir(sk):
+    for n in os.listdir(sk):
+        p = os.path.join(sk, n)
+        if os.path.islink(p) and not os.path.exists(p):
+            dangling += 1
+def few(xs):
+    return ", ".join(xs[:8]) + (" and %d more" % (len(xs) - 8) if len(xs) > 8 else "")
+print("packs" + S + str(len(order)) + S + ",".join(order))
+print("unknown" + S + ",".join(unknown))
+print("agents" + S + str(exp_a - len(miss_a)) + S + str(exp_a) + S + few(miss_a))
+print("skills" + S + str(exp_s - len(miss_s)) + S + str(exp_s) + S + few(miss_s))
+print("dangling" + S + str(dangling))'
+
+check_agents_linked() {
+  local pk src preset k a b c a_ok=0 a_tot=0 a_miss="" s_ok=0 s_tot=0 s_miss="" npacks=0 unknown="" dangling=0 err="" label
+  if [ ! -f "$STACK/config/packs.json" ]; then
+    note agents-linked "no config/packs.json in the c101 checkout (see stack-link): not checked"
+    return 0
+  fi
+  if pk=$(state_get packs 2>/dev/null); then src=state; else pk=$P_C101_PACKS src=profile; fi
+  preset=$(st preset)
+  while IFS=$US read -r k a b c; do
+    case $k in
+      error) err=$a ;;
+      packs) npacks=$a ;;
+      unknown) unknown=$a ;;
+      agents) a_ok=$a a_tot=$b a_miss=$c ;;
+      skills) s_ok=$a s_tot=$b s_miss=$c ;;
+      dangling) dangling=$a ;;
+    esac
+  done < <(pyrun "$PY_AGENTS" "$STACK" "$STACK/config/packs.json" "$pk" "$HOME/.claude" 2>/dev/null || true)
+  if [ -n "$err" ]; then
+    warn_ agents-linked "c101's config/packs.json is unreadable: not checked"
+    return 0
+  fi
+  label="preset ${preset:-none recorded}, packs ${pk:-all} from $src ($npacks packs with requires)"
+  if [ $((a_tot + s_tot)) -eq 0 ]; then
+    note agents-linked "the c101 checkout has no agent or skill for $label"
+  elif [ "$a_ok" = "$a_tot" ] && [ "$s_ok" = "$s_tot" ]; then
+    pass agents-linked "$a_ok/$a_tot agents and $s_ok/$s_tot skills linked for $label"
+  elif [ $((a_ok + s_ok)) -eq 0 ]; then
+    prof_sev agents-linked "no agent or skill linked for $label: c101 --user did not run. Fix: re-run $(rerun_cmd)"
+  else
+    warn_ agents-linked "$a_ok/$a_tot agents and $s_ok/$s_tot skills linked for $label${a_miss:+; agents missing: $a_miss}${s_miss:+; skills missing: $s_miss}. Fix: re-run $(rerun_cmd)"
+  fi
+  if [ -n "$unknown" ]; then warn_ agents-linked "packs not in c101's packs.json: ${unknown//,/, } (c101 renamed or dropped them; re-run $(rerun_cmd))"; fi
+  if [ "${dangling:-0}" -gt 0 ]; then warn_ agents-linked "$dangling dangling link(s) under ~/.claude/agents/stack or ~/.claude/skills (the c101 checkout moved or dropped them)"; fi
+  return 0
+}
+
+check_agents_linked
+
+# =====================================================================================================================
+# 7. Settings
+# =====================================================================================================================
+section "Settings"
+
+check_settings() {
+  local agent
+  case ${SJ[user]:-missing} in
+    missing)
+      fail "settings.json" "$SETTINGS missing: run $(rerun_cmd)"
+      warn_ settings-env "not checked ($(tilde "$SETTINGS") missing)"
+      return 0
+      ;;
+    invalid)
+      fail "settings.json" "$SETTINGS is not valid JSON (backups: $SETTINGS.bak-*)"
+      warn_ settings-env "not checked ($(tilde "$SETTINGS") is not valid JSON)"
+      return 0
+      ;;
+  esac
+  if [ -z "${SJ[env_missing]:-}" ]; then
+    pass settings-env "all ${SJ[env_total]:-0} c101 env settings present in settings.json${SJ[env_shown]:+ (${SJ[env_shown]})}"
+  else
+    warn_ settings-env "missing from the env of $(tilde "$SETTINGS"): ${SJ[env_missing]} (the depth guard and concurrency limits fall back to defaults). Fix: re-run $(rerun_cmd)"
+  fi
+  agent=$(helper jsontool.py get "$SETTINGS" agent 2>/dev/null || true)
+  if flag_has --main-agent; then
+    if [ "$agent" = delegator ]; then pass "main-agent" "delegator"; else warn_ "main-agent" "profile expects agent=delegator, settings has '${agent:-none}'"; fi
+  fi
+  if c101_flag_installed --enforce-models; then
+    if helper jsontool.py get "$SETTINGS" availableModels >/dev/null 2>&1; then pass "enforce-models" "availableModels set"; else warn_ "enforce-models" "profile expects availableModels in settings.json"; fi
+  fi
+  return 0
+}
+
+check_settings
+
+# =====================================================================================================================
+# 8. Learning: config, writable targets, the backstop timer (L1), logs, depth and learner statistics.
+# =====================================================================================================================
+section "Learning"
+
+DATA_DIR=${CLAUDE_STACK_DATA:-$HOME/.claude/stack-data}
+
+PY_LEARNING='import json, os, sys, time
+S = "\x1f"
+cfg_p, data = sys.argv[1], sys.argv[2]
+c, st = {}, "ok"
+try:
+    with open(cfg_p, encoding="utf-8") as fh:
+        c = json.load(fh)
+    if not isinstance(c, dict):
+        c, st = {}, "invalid"
+except FileNotFoundError:
+    st = "missing"
+except (OSError, ValueError):
+    st = "invalid"
+def w(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return "" if v is None else str(v).replace(S, " ").replace("\n", " ")[:40]
+print("config" + S + st)
+for k in ("enabled", "auto_apply", "apply_on"):
+    print(k + S + w(c.get(k)))
+def tb(name):
+    try:
+        with open(os.path.join(data, name), encoding="utf-8", errors="replace") as fh:
+            return sum(1 for line in fh if line.startswith("Traceback"))
+    except FileNotFoundError:
+        return -1
+    except OSError:
+        return -2
+print("tb_learn" + S + str(tb("learn.log")))
+print("tb_hook" + S + str(tb("hook-errors.log")))
+n, newest = 0, 0.0
+try:
+    for e in os.scandir(os.path.join(data, "obs")):
+        if e.is_file():
+            n += 1
+            newest = max(newest, e.stat().st_mtime)
+except OSError:
+    pass
+print("obs_count" + S + str(n))
+print("obs_age_h" + S + ("%.1f" % ((time.time() - newest) / 3600.0) if n else ""))'
+
+declare -A LJ=()
+read_learning_probe() {
+  local k v
+  while IFS=$US read -r k v; do
+    if [ -n "$k" ]; then LJ[$k]=$v; fi
+  done < <(pyrun "$PY_LEARNING" "$STACK/config/learning.json" "$DATA_DIR" 2>/dev/null || true)
+  return 0
+}
+
+check_learning_config() {
+  case ${LJ[config]:-missing} in
+    missing) note learning-config "~/.claude/stack/config/learning.json not found (see stack-link): not checked" ;;
+    invalid) warn_ learning-config "~/.claude/stack/config/learning.json is not valid JSON: c101's learner cannot run" ;;
+    *)
+      if [ "${LJ[enabled]:-}" = false ]; then
+        note learning-config "learning disabled (enabled=false in c101's config/learning.json)"
+      else
+        pass learning-config "enabled; auto_apply=${LJ[auto_apply]:-unset}, apply_on=${LJ[apply_on]:-unset}"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# c101's learner rewrites agent files atomically next to their symlink target (frontmatter.write_atomic: temp file in
+# the target's directory, then rename), so the target directories must be writable, and so must stack-data.
+check_learning_writable() {
+  local agents=$STACK/.claude/agents real d n_dirs=0 ro=0 sev
+  local -a probs=()
+  if [ -d "$agents" ]; then
+    real=$(cd -P -- "$agents" 2>/dev/null && pwd -P) || real=$agents
+    case $real in /nix/store/*) probs+=("agent files are in the read-only nix store ($real)") ;; esac
+    shopt -s globstar nullglob
+    for d in "$real"/**/; do
+      n_dirs=$((n_dirs + 1))
+      if [ ! -w "$d" ] || [ ! -x "$d" ]; then ro=$((ro + 1)); fi
+    done
+    shopt -u globstar nullglob
+    if [ "$ro" -gt 0 ]; then probs+=("$ro of $n_dirs agent directories under $(tilde "$real") are not writable"); fi
+  else
+    probs+=("no .claude/agents in the c101 checkout")
+  fi
+  if [ -d "$DATA_DIR" ]; then
+    if [ ! -w "$DATA_DIR" ]; then probs+=("$(tilde "$DATA_DIR") is not writable"); fi
+  elif [ ! -w "$(dirname -- "$DATA_DIR")" ]; then
+    probs+=("$(tilde "$DATA_DIR") does not exist and cannot be created")
+  fi
+  if [ "${#probs[@]}" -eq 0 ]; then
+    pass learning-writable "agent files ($n_dirs directories, through ~/.claude/agents/stack links) and $(tilde "$DATA_DIR") are writable"
+  else
+    if [ "${LJ[auto_apply]:-}" = true ] && [ "${LJ[enabled]:-}" != false ]; then sev=warn; else sev=info; fi
+    verdict "$sev" learning-writable "$(join_list '; ' "${probs[@]}"): learned maxTurns/effort cannot be applied"
+  fi
+  return 0
+}
+
+# L1 contract: learn_timer=true -> both units in the user unit dir start with the unit marker, the script is executable
+# and carries the file marker, and `systemctl --user is-enabled` succeeds for the timer.
+check_learning_timer() {
+  local u f script
+  local -a probs=()
+  script=$(learn_backstop_dest)
+  if [ "$LEARN_TIMER_STATE" != true ]; then
+    note learning-timer "not installed (state learn_timer=${LEARN_TIMER_STATE:-not recorded}): sessions that end without SessionEnd (Desktop quit, logout) keep no statistics; --learn-timer adds the backstop"
+    return 0
+  fi
+  for u in $LEARN_UNITS; do
+    f=$(user_unit_dir)/$u
+    if [ ! -f "$f" ]; then
+      probs+=("$u missing")
+    elif [ "$(head -n 1 "$f" 2>/dev/null)" != "$UNIT_MARKER" ]; then
+      probs+=("$u lacks the c101-linux unit marker")
+    fi
+  done
+  if [ ! -x "$script" ]; then
+    probs+=("$(tilde "$script") missing or not executable")
+  elif ! grep -qF -- "$LEARN_FILE_MARKER" "$script" 2>/dev/null; then
+    probs+=("$(tilde "$script") lacks the c101-linux file marker")
+  fi
+  if [ "$SYSTEMD_USER_OK" != 1 ]; then
+    probs+=("no reachable systemd user manager ($INIT_SYSTEM), so the timer cannot run")
+  elif ! systemctl --user is-enabled --quiet "$LEARN_TIMER_UNIT" 2>/dev/null; then
+    probs+=("$LEARN_TIMER_UNIT is not enabled (systemctl --user enable --now $LEARN_TIMER_UNIT)")
+  fi
+  if [ "${#probs[@]}" -eq 0 ]; then
+    pass learning-timer "$LEARN_TIMER_UNIT enabled; $(tilde "$script") in place"
+  else
+    warn_ learning-timer "$(join_list '; ' "${probs[@]}"). Fix: re-run $(rerun_cmd --learn-timer)"
+  fi
+  return 0
+}
+
+tb_word() { # tb_word COUNT: a Traceback count from the learning probe (-1 = no such log, -2 = unreadable)
+  case $1 in
+    -1) printf 'absent' ;;
+    -2) printf 'unreadable' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+check_learning_log() {
+  local tl=${LJ[tb_learn]:--1} th=${LJ[tb_hook]:--1} obs n=${LJ[obs_count]:-0} desc
+  if [ "$n" -gt 0 ]; then obs="newest observation ${LJ[obs_age_h]:-?} h old ($n files)"; else obs="no observations yet (they appear after sessions end)"; fi
+  desc="learn.log $(tb_word "$tl"), hook-errors.log $(tb_word "$th")"
+  if [ "$tl" -gt 0 ] || [ "$th" -gt 0 ]; then
+    warn_ learning-log "Traceback count: $desc (in $(tilde "$DATA_DIR")): the learner or a hook crashed; $obs"
+  else
+    pass learning-log "no Traceback ($desc); $obs"
+  fi
+  return 0
+}
+
+# c101's own statistics: `bin/stack depth` (spawn statistics of the depth guard) and `bin/stack learn report` (exit 1
+# with "no recommendations yet" before the first learner update). Only line counts are shown, not their output.
+check_depth_stats() {
+  local out rc=0 n
+  if [ ! -x "$STACK/bin/stack" ]; then
+    note depth-stats "not checked (~/.claude/stack/bin/stack missing; see stack-link)"
+    return 0
+  fi
+  out=$(tmo 60 "${NOKEYS[@]}" "$STACK/bin/stack" depth </dev/null 2>/dev/null) || rc=$?
+  if [ "$rc" = 0 ]; then
+    n=$(printf '%s\n' "$out" | grep -c ' spawns=' || true)
+    pass depth-stats "bin/stack depth ok ($n recent session(s) with spawn statistics)"
+  else
+    warn_ depth-stats "bin/stack depth exited $rc: the depth guard's statistics cannot be read"
+  fi
+  rc=0
+  out=$(tmo 60 "${NOKEYS[@]}" "$STACK/bin/stack" learn report </dev/null 2>/dev/null) || rc=$?
+  if [ "$rc" = 0 ]; then
+    n=$(printf '%s\n' "$out" | sed -n '2,$p' | grep -c . || true)
+    pass depth-stats "bin/stack learn report ok ($n agent recommendation line(s))"
+  elif [ "$rc" = 1 ] && [[ $out == *'no recommendations yet'* ]]; then
+    note depth-stats "no learning recommendations yet (the learner writes them after sessions end)"
+  else
+    warn_ depth-stats "bin/stack learn report exited $rc"
+  fi
+  return 0
+}
+
+read_learning_probe
+check_learning_config
+check_learning_writable
+check_learning_timer
+check_learning_log
+check_depth_stats
+
+# =====================================================================================================================
+# 9. Platform
+# =====================================================================================================================
+section "Platform"
+
 # --- NixOS ---------------------------------------------------------------------------------------------------------
 if [ "$IMMUTABLE" = nixos ]; then
   if [ -e /run/current-system/sw/share/nix-ld ] || [ -n "${NIX_LD:-}" ]; then pass "nix-ld" "enabled (foreign binaries such as uv's Python run)"; else fail "nix-ld" "programs.nix-ld.enable is off: uv and the Python builds it downloads cannot run (docs/PITFALLS.md, NixOS)"; fi
@@ -103,16 +1343,15 @@ else
 fi
 
 # --- uv and Python -------------------------------------------------------------------------------------------------
-export PATH="$HOME/.local/bin:$PATH"
 if have uv; then
-  pass "uv" "$(uv --version) at $(command -v uv)"
-  if py=$(uv python find --no-python-downloads 3.13 2>/dev/null) && [ -n "$py" ]; then
+  pass "uv" "$("${NOKEYS[@]}" uv --version) at $(command -v uv)"
+  if py=$("${NOKEYS[@]}" uv python find --no-python-downloads 3.13 2>/dev/null) && [ -n "$py" ]; then
     pass "python-3.13" "$py"
   else
-    fail "python-3.13" "uv has no CPython 3.13 (c101 pins it): run install-linux.sh or: uv python install 3.13"
+    fail "python-3.13" "uv has no CPython 3.13 (c101 pins it): run $(rerun_cmd) or: uv python install 3.13"
   fi
 else
-  fail "uv" "not found: run install-linux.sh (it bootstraps uv) or see https://docs.astral.sh/uv/"
+  fail "uv" "not found: run $(rerun_cmd) (it bootstraps uv) or see https://docs.astral.sh/uv/"
 fi
 
 # --- node ----------------------------------------------------------------------------------------------------------
@@ -126,46 +1365,23 @@ else
 fi
 
 # --- Claude clients ------------------------------------------------------------------------------------------------
-HAVE_CLI=0
-HAVE_DESKTOP=0
-have claude && HAVE_CLI=1
-desktop_installed && HAVE_DESKTOP=1
 if [ "$HAVE_CLI" = 1 ]; then pass "claude-cli" "$(command -v claude)"; fi
 if [ "$HAVE_DESKTOP" = 1 ]; then pass "claude-desktop" "installed"; fi
 if [ "$HAVE_CLI" = 0 ] && [ "$HAVE_DESKTOP" = 0 ]; then
   if [ "$PROFILE" = ci ]; then
     warn_ "claude-client" "neither the claude CLI nor Claude Desktop is installed (fine for ci)"
   else
-    fail "claude-client" "neither the claude CLI nor Claude Desktop found: install-linux.sh --install-cli or --install-desktop"
+    fail "claude-client" "neither the claude CLI nor Claude Desktop found: $(rerun_cmd --install-cli) or --install-desktop"
   fi
 fi
 
-# --- c101 link and settings ----------------------------------------------------------------------------------------
+# --- c101 link -----------------------------------------------------------------------------------------------------
 if [ -L "$STACK" ] && [ -d "$STACK" ] && is_c101_checkout "$STACK"; then
   pass "stack-link" "~/.claude/stack -> $(readlink "$STACK")"
 elif [ -e "$STACK" ]; then
   fail "stack-link" "$STACK exists but is not a link to a c101 checkout"
 else
-  fail "stack-link" "~/.claude/stack missing: run install-linux.sh"
-fi
-
-SETTINGS=$HOME/.claude/settings.json
-if [ -f "$SETTINGS" ]; then
-  if ! helper jsontool.py valid "$SETTINGS" 2>/dev/null; then
-    fail "settings.json" "$SETTINGS is not valid JSON (backups: $SETTINGS.bak-*)"
-  else
-    n=$(helper jsontool.py hook-count "$SETTINGS" "/.claude/stack/bin/stack hook" 2>/dev/null || echo 0)
-    if [ "${n:-0}" -gt 0 ]; then pass "hooks" "$n c101 hook command(s) in settings.json"; else fail "hooks" "no c101 hooks in $SETTINGS: c101 --user did not run"; fi
-    agent=$(helper jsontool.py get "$SETTINGS" agent 2>/dev/null || true)
-    if flag_has --main-agent; then
-      if [ "$agent" = delegator ]; then pass "main-agent" "delegator"; else warn_ "main-agent" "profile expects agent=delegator, settings has '${agent:-none}'"; fi
-    fi
-    if flag_has --enforce-models; then
-      if helper jsontool.py get "$SETTINGS" availableModels >/dev/null 2>&1; then pass "enforce-models" "availableModels set"; else warn_ "enforce-models" "profile expects availableModels in settings.json"; fi
-    fi
-  fi
-else
-  fail "settings.json" "$SETTINGS missing: run install-linux.sh"
+  fail "stack-link" "~/.claude/stack missing: run $(rerun_cmd)"
 fi
 
 # --- PATH for GUI apps ---------------------------------------------------------------------------------------------
@@ -173,10 +1389,8 @@ if [ "$P_PATH_INTEGRATION" = 1 ]; then
   pf=$(login_profile_file)
   if path_check_file "$pf"; then
     pass "login-profile" "one managed block in $(tilde "$pf")"
-    sh_bin=${LOGIN_SHELL_PATH:-/bin/sh}
-    case $LOGIN_SHELL in bash | zsh | fish) ;; *) sh_bin=/bin/sh ;; esac
-    found=$(env -i HOME="$HOME" USER="$(id -un)" PATH=/usr/bin:/bin "$sh_bin" -lc 'command -v uv; command -v npx' 2>/dev/null | tr '\n' ' ' || true)
-    if [ -n "$found" ] && printf '%s' "$found" | grep -q uv; then
+    found="$LOGIN_UV${LOGIN_NPX:+ $LOGIN_NPX}"
+    if [ -n "$LOGIN_UV" ]; then
       pass "login-path-effective" "a fresh $LOGIN_SHELL login shell finds: $found"
     else
       desktop_sev "login-path-effective" "a fresh $LOGIN_SHELL login shell does not find uv (found: '${found:-nothing}'); Desktop's PATH will be incomplete"
@@ -184,10 +1398,10 @@ if [ "$P_PATH_INTEGRATION" = 1 ]; then
     # stale nvm directory?
     cur_nvm=$(nvm_default_bin)
     if [ -n "$cur_nvm" ] && ! grep -qF "${cur_nvm#"$HOME"/}" "$pf" 2>/dev/null; then
-      warn_ "nvm-path" "nvm's default node moved ($cur_nvm): re-run install-linux.sh to refresh the block"
+      warn_ "nvm-path" "nvm's default node moved ($cur_nvm): re-run $(rerun_cmd) to refresh the block"
     fi
   else
-    desktop_sev "login-profile" "no single c101-linux block in $(tilde "$pf"): Claude Desktop will not see uv/node/docker. Re-run install-linux.sh"
+    desktop_sev "login-profile" "no single c101-linux block in $(tilde "$pf"): Claude Desktop will not see uv/node/docker. Re-run $(rerun_cmd)"
   fi
   if envd_wanted "$P_ENVIRONMENT_D"; then
     if [ -f "$(envd_file)" ]; then pass "environment.d" "$(tilde "$(envd_file)")"; else note "environment.d" "no $(tilde "$(envd_file)") (only needed for GUI sessions without a login shell)"; fi
@@ -253,7 +1467,7 @@ if [ "$RUNTIME" = podman ]; then
     fi
     missing_cg=$(cgroup_missing_controllers)
     if [ -n "$missing_cg" ]; then
-      if [ "$sandbox_expected" = 1 ]; then fail "cgroup-delegation" "controllers not delegated to your user manager: $missing_cg (Ubuntu 22.04: systemd 249); c101's sandbox passes --cpus, so it cannot start. Fix: install-linux.sh --sandbox writes /etc/systemd/system/user@.service.d/delegate.conf (Delegate=cpu cpuset io memory pids), then log out and in"; else warn_ "cgroup-delegation" "controllers not delegated: $missing_cg (rootless limits will fail; see docs/PITFALLS.md)"; fi
+      if [ "$sandbox_expected" = 1 ]; then fail "cgroup-delegation" "controllers not delegated to your user manager: $missing_cg (Ubuntu 22.04: systemd 249); c101's sandbox passes --cpus, so it cannot start. Fix: $(rerun_cmd --sandbox) writes /etc/systemd/system/user@.service.d/delegate.conf (Delegate=cpu cpuset io memory pids), then log out and in"; else warn_ "cgroup-delegation" "controllers not delegated: $missing_cg (rootless limits will fail; see docs/PITFALLS.md)"; fi
     else
       pass "cgroup-delegation" "needed controllers delegated (or cgroup v1/unknown)"
     fi
@@ -264,13 +1478,13 @@ if [ "$RUNTIME" = podman ]; then
     fi
     if [ "$(selinux_mode)" = Enforcing ]; then note "selinux" "enforcing: c101-podman disables label separation for the sandbox container (docs/PITFALLS.md)"; fi
   elif [ "$sandbox_expected" = 1 ]; then
-    fail "podman" "not installed but the desktop-sandbox is part of this profile: install-linux.sh --sandbox"
+    fail "podman" "not installed but the desktop-sandbox is part of this profile: $(rerun_cmd --sandbox)"
   else
     note "podman" "not installed (only needed for the desktop-sandbox, --sandbox)"
   fi
   # Profiles that write the login-profile block (standard, full, headless) default the sandbox runtime to podman.
   if [ "$sandbox_expected" = 1 ] || [ "$P_PATH_INTEGRATION" = 1 ]; then
-    if [ -x "$HOME/.local/bin/c101-podman" ]; then pass "podman-wrapper" "~/.local/bin/c101-podman"; else warn_ "podman-wrapper" "missing: rootless uid mapping for the sandbox needs it (re-run install-linux.sh)"; fi
+    if [ -x "$HOME/.local/bin/c101-podman" ]; then pass "podman-wrapper" "~/.local/bin/c101-podman"; else warn_ "podman-wrapper" "missing: rootless uid mapping for the sandbox needs it (re-run $(rerun_cmd))"; fi
     if [ -n "${DESKTOP_SANDBOX_RUNTIME:-}" ]; then
       pass "sandbox-runtime-env" "DESKTOP_SANDBOX_RUNTIME=$DESKTOP_SANDBOX_RUNTIME"
     else

@@ -8,11 +8,13 @@ Stdlib only, Python 3.9+. Rules:
   * An existing file is copied to <file>.bak-<UTC timestamp> before it changes; an unchanged file is not touched.
   * A server name that already exists with different content is left alone (reported as "conflicts"), so a
     hand-written entry is never clobbered; entries this tool added earlier (same name, same content) are no-ops.
+  * An existing entry equal to one an earlier release shipped (S's "_legacy" map: name -> list of entries) is
+    ours too: merge replaces it with the current entry (reported as "updated") and remove deletes it.
   * "~" at the start of a command or argument is expanded to $HOME.
 
   desktop_config.py merge  --config F --servers S.json [--force] [--dry-run]
   desktop_config.py remove --config F --servers S.json [--names a,b] [--force] [--dry-run]
-                                                                               removes only entries equal to S's
+                                                                 removes only entries equal to S's (or S's legacy)
   desktop_config.py validate --config F
   desktop_config.py running                                                    exit 0 when Desktop is running
 
@@ -91,6 +93,22 @@ def load_servers(path: str, home: str) -> Dict[str, Any]:
     return {k: expand(v, home) for k, v in servers.items() if not k.startswith("_")}
 
 
+def load_legacy(path: str, home: str) -> Dict[str, List[Any]]:
+    """S's "_legacy" map (name -> entries earlier releases shipped), expanded; "_" keys are annotations."""
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    legacy = data.get("_legacy") if isinstance(data, dict) else None
+    out: Dict[str, List[Any]] = {}
+    if not isinstance(legacy, dict):
+        return out
+    for name, entries in legacy.items():
+        if name.startswith("_") or not isinstance(entries, list):
+            continue
+        out[name] = [expand({k: v for k, v in e.items() if not k.startswith("_")}, home)
+                     for e in entries if isinstance(e, dict)]
+    return out
+
+
 def load_config(path: str) -> Optional[Dict[str, Any]]:
     try:
         with open(path, encoding="utf-8") as fh:
@@ -143,26 +161,33 @@ def write_json(path: str, data: Dict[str, Any]) -> None:
         raise
 
 
-def merge(config: Dict[str, Any], servers: Dict[str, Any]) -> Dict[str, List[str]]:
+def merge(config: Dict[str, Any], servers: Dict[str, Any],
+          legacy: Optional[Dict[str, List[Any]]] = None) -> Dict[str, List[str]]:
     cur = config.get("mcpServers", {})
     if not isinstance(cur, dict):
         raise ValueError("mcpServers is not an object; nothing was changed")
-    res: Dict[str, List[str]] = {"added": [], "unchanged": [], "conflicts": []}
+    old = legacy or {}
+    res: Dict[str, List[str]] = {"added": [], "updated": [], "unchanged": [], "conflicts": []}
     for name, entry in servers.items():
         if name not in cur:
             cur[name] = entry
             res["added"].append(name)
         elif cur[name] == entry:
             res["unchanged"].append(name)
+        elif cur[name] in old.get(name, []):
+            cur[name] = entry  # an entry an earlier release shipped: upgrade it in place
+            res["updated"].append(name)
         else:
             res["conflicts"].append(name)
-    if res["added"]:
+    if res["added"] or res["updated"]:
         config["mcpServers"] = cur
     return res
 
 
-def remove(config: Dict[str, Any], servers: Dict[str, Any]) -> Dict[str, List[str]]:
+def remove(config: Dict[str, Any], servers: Dict[str, Any],
+           legacy: Optional[Dict[str, List[Any]]] = None) -> Dict[str, List[str]]:
     cur = config.get("mcpServers")
+    old = legacy or {}
     res: Dict[str, List[str]] = {"removed": [], "absent": [], "modified": []}
     if not isinstance(cur, dict):
         res["absent"] = list(servers)
@@ -170,7 +195,7 @@ def remove(config: Dict[str, Any], servers: Dict[str, Any]) -> Dict[str, List[st
     for name, entry in servers.items():
         if name not in cur:
             res["absent"].append(name)
-        elif cur[name] == entry:
+        elif cur[name] == entry or cur[name] in old.get(name, []):
             del cur[name]
             res["removed"].append(name)
         else:
@@ -208,12 +233,13 @@ def main(argv: List[str]) -> int:
     if not a.servers:
         raise SystemExit("--servers is required")
     servers = load_servers(a.servers, home)
+    legacy = load_legacy(a.servers, home)
     if a.names:
         wanted = {n.strip() for n in a.names.split(",") if n.strip()}
         servers = {k: v for k, v in servers.items() if k in wanted}
     work: Dict[str, Any] = json.loads(json.dumps(config)) if config is not None else {}
     try:
-        res = merge(work, servers) if a.cmd == "merge" else remove(work, servers)
+        res = merge(work, servers, legacy) if a.cmd == "merge" else remove(work, servers, legacy)
     except ValueError as exc:
         print(json.dumps({"error": str(exc)}))
         print(str(exc), file=sys.stderr)

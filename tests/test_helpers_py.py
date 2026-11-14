@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import unittest
 
@@ -201,9 +202,33 @@ class JsonToolTests(unittest.TestCase):
     def test_has_keys_and_env_snapshot(self) -> None:
         self.f.write_text(json.dumps({"agent": "x", "env": {"A": "1"}}))
         self.assertEqual(json.loads(self.jt("has-keys", str(self.f), "agent", "nope", "env").stdout), ["agent", "env"])
-        self.assertEqual(json.loads(self.jt("env-snapshot", str(self.f)).stdout), {"A": "1"})
+        self.assertEqual(json.loads(self.jt("env-snapshot", str(self.f)).stdout), ["A"], "names only (R3), never the value")
         self.f.write_text("{}")
-        self.assertEqual(json.loads(self.jt("env-snapshot", str(self.f)).stdout), {})
+        self.assertEqual(json.loads(self.jt("env-snapshot", str(self.f)).stdout), [])
+
+    def test_env_snapshot_never_prints_a_value(self) -> None:
+        """R3: a token in the user's settings.json env must not travel into state.json, so the snapshot holds names only."""
+        token = "ghp_SENTINEL_settings_env_value_0123456789"
+        self.f.write_text(json.dumps({"env": {"MY_TOKEN": token, "B": "2"}}))
+        res = self.jt("env-snapshot", str(self.f))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn(token, res.stdout + res.stderr)
+        self.assertEqual(json.loads(res.stdout), ["B", "MY_TOKEN"])
+        self.f.write_text(json.dumps({"env": "not-an-object"}))
+        self.assertEqual(json.loads(self.jt("env-snapshot", str(self.f)).stdout), [])
+
+    def jt_stdin(self, text: str, *args: str):
+        return subprocess.run([sys.executable, "-I", str(LIB / "jsontool.py"), *args], input=text, capture_output=True, text=True,
+                              env=self.sb.env(), cwd=str(self.sb.base), timeout=120)
+
+    def test_env_names_cuts_an_older_states_object_down_to_its_keys(self) -> None:
+        token = "ghp_SENTINEL_old_state_value"
+        res = self.jt_stdin(json.dumps({"B": token, "A": "1"}), "env-names", "-")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout), ["A", "B"])
+        self.assertNotIn(token, res.stdout)
+        self.assertEqual(json.loads(self.jt_stdin(json.dumps(["Z", "Y"]), "env-names", "-").stdout), ["Y", "Z"])
+        self.assertEqual(self.jt_stdin("{not json", "env-names", "-").returncode, 2)
 
     def test_strip_env_removes_only_what_c101_added_and_still_holds(self) -> None:
         src = self.sb.home / "c101-settings.json"
@@ -214,6 +239,24 @@ class JsonToolTests(unittest.TestCase):
         self.assertEqual(json.loads(res.stdout)["removed"], ["MAX"])
         self.assertEqual(json.loads(self.f.read_text())["env"], {"DEPTH": "9", "USERSET": "x", "MINE": "1"})
         self.assertEqual(len(list(self.sb.home.glob("settings.json.bak-*"))), 1)
+
+    def test_strip_env_takes_names_an_older_states_object_and_stdin(self) -> None:
+        """R3: BEFORE is a list of names; an older state file's object still works (its keys count); `-` reads it from stdin, so
+        no value ever sits on a command line."""
+        src = self.sb.home / "c101-settings.json"
+        src.write_text(json.dumps({"env": {"MAX": "40000", "DEPTH": "8", "USERSET": "x"}}))
+        original = json.dumps({"env": {"MAX": "40000", "DEPTH": "8", "USERSET": "x", "MINE": "1"}})
+        for label, before, via_stdin in (("names", json.dumps(["USERSET"]), False), ("older object", json.dumps({"USERSET": "x"}), False),
+                                         ("stdin names", json.dumps(["USERSET"]), True), ("stdin object", json.dumps({"USERSET": "x"}), True)):
+            with self.subTest(label):
+                self.f.write_text(original)
+                if via_stdin:
+                    res = self.jt_stdin(before, "strip-env", str(self.f), str(src), "-")
+                else:
+                    res = self.jt("strip-env", str(self.f), str(src), before)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(sorted(json.loads(res.stdout)["removed"]), ["DEPTH", "MAX"])
+                self.assertEqual(json.loads(self.f.read_text())["env"], {"USERSET": "x", "MINE": "1"})
 
     def test_writes_go_through_symlinks(self) -> None:
         real = self.sb.base / "real.json"

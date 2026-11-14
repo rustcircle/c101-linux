@@ -161,7 +161,7 @@ node_fix_hint() {
     Playwright MCP needs Node >= $NODE_MIN_MAJOR with npx. Fix without any piped installer:
       - Ubuntu 22.04 ships Node 12: use a version manager as your user (mise: https://mise.jdx.dev,
         fnm: https://github.com/Schniz/fnm, nvm: https://github.com/nvm-sh/nvm, volta: https://volta.sh)
-        and re-run this installer; the PATH block picks their shims up.
+        and re-run $(rerun_cmd); the PATH block picks their shims up.
       - or enable your vendor's Node repository yourself after reading its instructions.
 HINT_EOF
 }
@@ -406,6 +406,28 @@ setup_playwright_deps() {
     warn "--playwright-deps needs node >= $NODE_MIN_MAJOR with npx; skipped"
     return 0
   fi
-  info "installing Chromium's system libraries via Playwright's own installer (apt packages, needs root)"
-  run_priv env "PATH=$PATH" npx -y playwright@latest install-deps chromium || warn "playwright install-deps failed"
+  # The playwright-core version @playwright/mcp@latest pins (pw_r1_commands, lib/prewarm.sh, the single place that
+  # names the browser and how it is installed), so the libraries match the Chromium revision the MCP launches.
+  declare -F pw_r1_commands >/dev/null || die "setup_playwright_deps needs lib/prewarm.sh (pw_r1_commands)"
+  local ver="" rc=0
+  local -a to=() pkg=()
+  pw_r1_commands ""
+  if [ "$DRY_RUN" = 1 ]; then
+    run "${PW_VERSION_CMD[@]}"
+    ver="<version-from-npm-view>"
+  else
+    if have timeout; then to=(timeout 300); fi
+    ver=$(${to[@]+"${to[@]}"} "${PW_VERSION_CMD[@]}" </dev/null 2>/dev/null | tail -n 1) || rc=$?
+    ver=${ver//[\'\"[:space:]]/}
+    if [ "$rc" != 0 ] || ! [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*$ ]]; then
+      warn "--playwright-deps: could not read the playwright-core version of $PW_MCP_SPEC (npm view, exit $rc); Chromium's system libraries were not installed"
+      next_step "Chromium's system libraries are missing: re-run $(rerun_cmd --playwright-deps) when npm can reach the registry"
+      return 0
+    fi
+  fi
+  pw_r1_commands "$ver"
+  pkg=("${PW_INSTALL_CMD[@]:0:3}") # npx -y playwright-core@<version>
+  [[ ${pkg[2]:-} == playwright-core@* ]] || pkg=(npx -y "playwright-core@$ver")
+  info "installing Chromium's system libraries via playwright-core $ver install-deps (apt packages, needs root)"
+  run_priv env "PATH=$PATH" "${pkg[@]}" install-deps chromium || warn "playwright-core install-deps failed"
 }

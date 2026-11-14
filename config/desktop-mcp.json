@@ -1,5 +1,5 @@
 {
-  "_doc": "Server set for `install-linux.sh --desktop-chat-mcp`: merged into ~/.config/Claude/claude_desktop_config.json under mcpServers. A leading ~ or ${HOME} is expanded to the real home directory at install time. Only stdio servers fit this file (it has no headersHelper), so exa, jina, spider and context7 (HTTP) are not here; add them as connectors in the app. neural-memory is left out on purpose: it has one SQLite writer owned by the delegator agent. No secrets live here: bin/mcp-run reads ~/.claude/stack.env itself. Names are prefixed c101- so they never collide with entries you wrote by hand.",
+  "_doc": "Server set for `install-linux.sh --desktop-chat-mcp`: merged into ~/.config/Claude/claude_desktop_config.json under mcpServers. A leading ~ or ${HOME} is expanded to the real home directory at install time. Only stdio servers fit this file (it has no headersHelper), so exa, jina, spider and context7 (HTTP) are not here; add them as connectors in the app. neural-memory is left out on purpose: it has one SQLite writer owned by the delegator agent. No secrets live here: bin/mcp-run reads ~/.claude/stack.env itself. Names are prefixed c101- so they never collide with entries you wrote by hand. Playwright gets --browser chromium: its default Chrome channel rarely exists on Linux (never on arm64); install-linux.sh --playwright-browser installs Playwright's Chromium at user level.",
   "mcpServers": {
     "c101-fetch": {
       "command": "~/.claude/stack/bin/mcp-run",
@@ -11,6 +11,8 @@
         "npx",
         "-y",
         "@playwright/mcp@latest",
+        "--browser",
+        "chromium",
         "--headless",
         "--isolated",
         "--caps=vision,pdf,devtools",
@@ -32,5 +34,24 @@
         "~/.claude/stack/bin/desktop-sandbox"
       ]
     }
+  },
+  "_legacy": {
+    "_doc": "Entries earlier releases shipped under the same names (expanded like mcpServers). lib/desktop_config.py treats an installed entry equal to one of these as its own: merge replaces it with the current entry (reported as updated) and remove deletes it. Append when an entry above changes; never edit a recorded one.",
+    "c101-playwright": [
+      {
+        "_since": "96050d1 (before --browser chromium)",
+        "command": "~/.claude/stack/bin/mcp-run",
+        "args": [
+          "npx",
+          "-y",
+          "@playwright/mcp@latest",
+          "--headless",
+          "--isolated",
+          "--caps=vision,pdf,devtools",
+          "--output-dir=${HOME}/.claude/stack-data/playwright",
+          "--viewport-size=1280x800"
+        ]
+      }
+    ]
   }
 }

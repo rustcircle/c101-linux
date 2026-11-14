@@ -190,6 +190,24 @@ tilde() { local p=$1; if [ "${p#"$HOME"/}" != "$p" ]; then printf '~/%s\n' "${p#
 
 next_step() { NEXT_STEPS+=("$*"); }
 
+# rerun_profile_sfx: " --profile NAME" for the effective profile (R1: the recorded one when this run did not name one,
+# see install-linux.sh profile_sticky), empty for standard, which is the default a flag-less run also resolves to. PROFILE
+# is set by every entry point after it resolved the profile; before that the recorded one is read from state.
+rerun_profile_sfx() {
+  local p=${PROFILE:-}
+  if [ -z "$p" ]; then p=$(state_get profile 2>/dev/null) || p=""; fi
+  if [ -n "$p" ] && [ "$p" != standard ]; then printf ' --profile %s' "$p"; fi
+}
+
+# rerun_cmd [FLAG...]: the one place that builds a re-run hint for a user (R1): `<root>/install-linux.sh FLAG... --profile P`.
+# A hint that dropped --profile would reinstall a minimal, headless or ci host as standard. Key hints go through
+# keys_rerun_cmd / keys_fix_cmd, which use rerun_profile_sfx as well.
+rerun_cmd() {
+  local root
+  root=$(tilde "${C101L_ROOT:-.}")
+  printf '%s/install-linux.sh%s%s\n' "$root" "${*:+ $*}" "$(rerun_profile_sfx)"
+}
+
 # Files that deferred root commands refer to live here, so they still exist after this run (the temp dir is gone).
 pending_dir() { printf '%s\n' "$(dirname -- "$(state_file)")/pending"; }
 

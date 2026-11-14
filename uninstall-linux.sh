@@ -2,6 +2,11 @@
 # uninstall-linux.sh: remove what install-linux.sh added, tracked in ~/.local/state/c101-linux/state.json.
 # It calls c101's own reversible flags, strips c101's hooks and removes ~/.claude symlinks that point into the c101
 # checkout. It never touches ~/.claude/stack.env, ~/.claude/stack-data, uv, Node or distro packages.
+# Overlay features are removed only as the state file recorded them: the learning backstop timer (its units through
+# systemd_units, a run in progress stopped, its script through files_installed, then its stamps), the fal-runner
+# agent link and fal-mcp.json (files_installed, through fal_mcp_uninstall), Desktop entries the installer added or
+# updated (desktop_added_names).
+# The keys file, its .bak-* backups and shared download caches are named in the closing hints, never read or changed.
 # Usage: uninstall-linux.sh [--dry-run] [--yes] [--purge-apt-repo] [--purge-clone] [--keep-c101] [--force] [--no-sudo]
 if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo "uninstall-linux.sh needs bash >= 4" >&2
@@ -24,6 +29,10 @@ PROG=${0##*/}
 . "$C101L_ROOT/lib/pathprofile.sh"
 # shellcheck source=lib/services.sh
 . "$C101L_ROOT/lib/services.sh"
+# shellcheck source=lib/learning.sh
+. "$C101L_ROOT/lib/learning.sh"
+# shellcheck source=lib/falmcp.sh
+. "$C101L_ROOT/lib/falmcp.sh"
 
 usage() {
   cat <<USAGE_EOF
@@ -39,8 +48,9 @@ $PROG: remove what install-linux.sh added
   --allow-root         run as root anyway (containers/CI)
   -h, --help
 
-Left in place on purpose: ~/.claude/stack.env, ~/.claude/stack-data, uv and Python, Node, distro packages
-(podman, claude-desktop), the container image, linger. Commands for those are printed at the end.
+Left in place on purpose: ~/.claude/stack.env and its .bak-* backups, ~/.claude/stack-data, uv and Python, Node,
+distro packages (podman, claude-desktop), the container image, linger, Playwright's Chromium (~/.cache/ms-playwright)
+and the uv/npm caches the pre-warm filled. Commands or paths for those are printed at the end.
 Exit codes: 0 ok, 1 failure, 2 usage, 3 refused.
 USAGE_EOF
 }
@@ -99,7 +109,9 @@ main() {
 
   # --- where c101 lives -------------------------------------------------------------------------------------------
   C101_SRC=$(state_get c101_source 2>/dev/null || true)
-  if [ -z "$C101_SRC" ] && [ -L "$HOME/.claude/stack" ]; then C101_SRC=$(readlink "$HOME/.claude/stack"); fi
+  # The ~/.claude/stack link is a guess for the no-state fallback only. A state file without c101_source (a --keys-only
+  # run, or an install that stopped before c101's installer) records that this overlay never installed c101.
+  if [ -z "$C101_SRC" ] && [ ! -f "$sf" ] && [ -L "$HOME/.claude/stack" ]; then C101_SRC=$(readlink "$HOME/.claude/stack"); fi
   local c101_flags
   c101_flags=$(state_get c101_flags 2>/dev/null || true)
 
@@ -119,6 +131,8 @@ main() {
   fi
 
   # --- Desktop config entries -------------------------------------------------------------------------------------
+  # desktop_added_names holds the entries the installer reported as added or as updated (an earlier release's entry
+  # upgraded in place); desktop_config.py removes each only while it still equals the shipped or a legacy entry.
   local names cfg
   names=$(state_get desktop_added_names 2>/dev/null || true)
   cfg=$(state_get desktop_config_path 2>/dev/null || true)
@@ -142,18 +156,29 @@ main() {
 
   # --- services, wrapper, links -----------------------------------------------------------------------------------
   step "Podman services and installed commands"
+  # Every unit in systemd_units: the Podman units and the learning backstop's service and timer (timers disabled first).
   remove_podman_services
+  # Without a state file nothing lists the learning backstop: check its default paths (R5).
+  if [ ! -f "$sf" ]; then learn_backstop_remove_defaults; fi
+  # A backstop run still in progress is stopped now that its timer is disabled, before its script and its stamps go
+  # (RV1 R4); nothing happens when the service is idle or absent.
+  learn_backstop_stop
   local installed f
   installed=$(state_get files_installed 2>/dev/null || true)
   if [ -n "$installed" ]; then
     while IFS= read -r f; do
       [ -n "$f" ] || continue
+      # The fal-runner agent and fal-mcp.json are left to fal_mcp_uninstall below, which checks they are still ours.
+      case $f in */agents/fal-runner.md | */c101/fal-mcp.json) continue ;; esac
+      # Marked files only: c101-podman, ~/.local/bin/c101-learn-backstop and the other commands the installer wrote.
       if [ -f "$f" ] && grep -q 'c101-linux managed file' "$f" 2>/dev/null; then
         run rm -f -- "$f"
         info "removed $(tilde "$f")"
       fi
     done < <(helper_list "$installed")
   fi
+  # The backstop's per-transcript stamps live in the state directory; they go before the state file and directory do.
+  learn_timer_purge_stamps
   local sysf
   sysf=$(state_get system_files 2>/dev/null || true)
   if [ -n "$sysf" ]; then
@@ -168,6 +193,10 @@ main() {
   local lg
   lg=$(state_get linger_enabled_by_overlay 2>/dev/null || true)
   if [ "$lg" = true ]; then next_step "Linger was enabled by the installer; to turn it off: sudo loginctl disable-linger $(id -un)"; fi
+
+  # --- fal MCP: the fal-runner agent link and the whole-session config, as files_installed recorded them -----------
+  # Needs the state file (files_installed, overlay_root, fal_mcp_config_sha256); without one it checks the default paths.
+  fal_mcp_uninstall
 
   # --- managed settings -------------------------------------------------------------------------------------------
   local ms
@@ -193,6 +222,8 @@ main() {
   # --- c101 itself ------------------------------------------------------------------------------------------------
   if [ "$OPT_KEEP_C101" = 1 ]; then
     info "--keep-c101: c101's settings, hooks and links are left as they are"
+  elif [ -z "$C101_SRC" ] && [ -f "$sf" ]; then
+    info "the state file records no c101 install by this overlay (a --keys-only run, for one): c101's settings, hooks and links are left as they are"
   elif [ -z "$C101_SRC" ]; then
     warn "cannot tell where c101 is installed (no state and no ~/.claude/stack link): nothing to undo there"
   else
@@ -201,11 +232,17 @@ main() {
     case " $c101_flags " in *" --main-agent "*) un+=(--no-main-agent) ;; esac
     case " $c101_flags " in *" --enforce-models "*) un+=(--no-enforce-models) ;; esac
     if [ -n "$c101_flags" ]; then un+=(--no-python-default); fi
-    if [ "${#un[@]}" -gt 0 ] && [ -d "$C101_SRC" ] && is_c101_checkout "$C101_SRC"; then
+    local undo_hint="remove the 'agent' key, availableModels, enforceAvailableModels, UV_PYTHON, UV_PYTHON_PREFERENCE"
+    if [ "${#un[@]}" -gt 0 ] && [ -d "$C101_SRC" ] && is_c101_checkout "$C101_SRC" && [ ! -e "$HOME/.claude/stack.env" ]; then
+      # Read-only existence test: c101's installer (any flag) first creates ~/.claude/stack.env from its template when
+      # it is missing, and the keys file is user data this uninstaller never writes. So the reversal is the user's.
+      warn "c101 reversal (${un[*]}) skipped: c101's installer would create ~/.claude/stack.env from its template"
+      next_step "Undo c101's settings by hand in ~/.claude/settings.json: $undo_hint (or run c101's installer with ${un[*]} yourself; it recreates ~/.claude/stack.env from the template)"
+    elif [ "${#un[@]}" -gt 0 ] && [ -d "$C101_SRC" ] && is_c101_checkout "$C101_SRC"; then
       info "c101 reversal flags: ${un[*]}"
       c101_exec_light "${un[@]}" || warn "c101 reversal exited non-zero; check ~/.claude/settings.json"
     elif [ "${#un[@]}" -gt 0 ]; then
-      warn "c101 checkout $C101_SRC is gone; undo by hand in ~/.claude/settings.json: remove the 'agent' key, availableModels, enforceAvailableModels, UV_PYTHON, UV_PYTHON_PREFERENCE"
+      warn "c101 checkout $C101_SRC is gone; undo by hand in ~/.claude/settings.json: $undo_hint"
     fi
     # Hooks are not removed by any c101 flag; left behind they would fail on every session once the link is gone.
     if [ -f "$HOME/.claude/settings.json" ]; then
@@ -218,7 +255,8 @@ main() {
     before=$(state_get settings_env_before 2>/dev/null || true)
     if [ -n "$before" ] && [ -f "$HOME/.claude/settings.json" ] && [ -f "$C101_SRC/.claude/settings.json" ]; then
       # shellcheck disable=SC2046
-      res=$(helper jsontool.py strip-env "$HOME/.claude/settings.json" "$C101_SRC/.claude/settings.json" "$before" $(_helper_dry_flag)) &&
+      # BEFORE goes in on stdin ("-"): an older state may still hold an object with values, which must not reach a command line.
+      res=$(helper jsontool.py strip-env "$HOME/.claude/settings.json" "$C101_SRC/.claude/settings.json" - $(_helper_dry_flag) <<<"$before") &&
         info "c101 env keys removed from settings.json: $(json_field "$res" removed)"
     elif [ -z "$before" ]; then
       info "no record of settings.json env before c101 ran: its env keys (MAX_MCP_OUTPUT_TOKENS, CLAUDE_CODE_MAX_*) are left in place"
@@ -292,7 +330,13 @@ main() {
     rmdir "$(dirname -- "$sf")" 2>/dev/null || true
     info "state file removed"
   fi
-  next_step "Kept: ~/.claude/stack.env and ~/.claude/stack-data (your keys and learning data), uv, Node and distro packages"
+  # Manual-cleanup hints, paths only: the keys file and its backups are user data, the caches are shared with other
+  # tools, so nothing below is read, written or removed by this script.
+  next_step "Kept, your data: $(tilde "${CLAUDE_STACK_ENV:-$HOME/.claude/stack.env}") (API keys) and ~/.claude/stack-data (learning data)"
+  next_step "Kept: the keys file's backups from --keys-overwrite, $(tilde "${CLAUDE_STACK_ENV:-$HOME/.claude/stack.env}").bak-<UTC time> (beside its target if it is a symlink); they hold key values, so delete the ones you no longer need by hand"
+  next_step "Kept: Playwright's Chromium for Playwright MCP, downloaded at user level into $(tilde "${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}") (default ~/.cache/ms-playwright); remove it by hand when no other Playwright tool needs it"
+  next_step "Kept: caches the pre-warm filled, shared with other tools: uv's (uv cache clean mcp-server-fetch neural-memory markitdown-mcp) and npm's (npx packages in ~/.npm/_npx; npm cache clean --force empties the download cache)"
+  next_step "Kept: uv and Python, Node and distro packages"
   print_manual_and_next
   if [ "$DRY_RUN" = 1 ]; then log ""; log "dry run complete: nothing was removed."; fi
 }

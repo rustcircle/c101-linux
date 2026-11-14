@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "fal": {
+      "type": "http",
+      "url": "https://mcp.fal.ai/mcp",
+      "headersHelper": "exec \"$HOME/.claude/stack/bin/mcp-headers\" fal"
+    }
+  }
+}

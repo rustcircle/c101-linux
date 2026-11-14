@@ -3,7 +3,13 @@
 # profiles.sh: read config/profiles/NAME.conf (KEY=VALUE lines, whole-line # comments; never sourced) and
 # combine it with command-line overrides into the effective plan.
 
-PROFILE_KEYS="DESCRIPTION C101_FLAGS C101_PACKS PATH_INTEGRATION ENVIRONMENT_D SANDBOX PLAYWRIGHT_DEPS DESKTOP_CHECKS NO_SUDO ASSUME_YES LINK_BINS CONTAINER_RUNTIME PODMAN_SERVICES DOCKER_HOST_PODMAN"
+PROFILE_KEYS="DESCRIPTION C101_FLAGS C101_PACKS PATH_INTEGRATION ENVIRONMENT_D SANDBOX PLAYWRIGHT_DEPS DESKTOP_CHECKS NO_SUDO ASSUME_YES LINK_BINS CONTAINER_RUNTIME PODMAN_SERVICES DOCKER_HOST_PODMAN PRESET KEYS IMAGE_BACKEND FAL_MCP PREWARM_MCP PLAYWRIGHT_BROWSER LEARN_TIMER"
+
+# Defaults for the parity keys when a profile file omits them (a custom profile written before they existed); every
+# shipped profile sets all of them. fal image generation is c101's main use, so it is on by default (D3); the steps
+# that add systemd units or a browser download stay off unless a profile asks for them. PRESET defaults to empty:
+# the profile's C101_PACKS then decides (empty = all packs). KEYS_OVERWRITE is never a profile key (--keys-overwrite).
+PROFILE_DEFAULTS="KEYS=auto IMAGE_BACKEND=fal FAL_MCP=1 PREWARM_MCP=1 PLAYWRIGHT_BROWSER=0 LEARN_TIMER=0"
 
 profile_list() {
   local f out=""
@@ -24,6 +30,7 @@ profile_load() {
   f="$C101L_ROOT/config/profiles/$name.conf"
   [ -r "$f" ] || usage_error "unknown profile '$name' (available: $(profile_list))"
   for k in $PROFILE_KEYS; do printf -v "P_$k" '%s' ""; done
+  for k in $PROFILE_DEFAULTS; do printf -v "P_${k%%=*}" '%s' "${k#*=}"; done
   while IFS= read -r line || [ -n "$line" ]; do
     case $line in '' | '#'*) continue ;; esac
     key=${line%%=*}
@@ -33,6 +40,15 @@ profile_load() {
     [ "$known" = 1 ] || die "$f: unknown key '$key'"
     printf -v "P_$key" '%s' "$val"
   done <"$f"
+}
+
+# profile_check_bool KEY...: P_<KEY> must be 0 or 1, so a typo in a profile file cannot silently switch a step off.
+profile_check_bool() {
+  local k v
+  for k in "$@"; do
+    v=P_$k
+    case ${!v-} in 0 | 1) ;; *) die "profile '${PROFILE:-?}': $k must be 0 or 1 (found '${!v-}')" ;; esac
+  done
 }
 
 # flag_add FLAG / flag_del FLAG: edit the token list in P_C101_FLAGS (exact token match).
@@ -69,6 +85,14 @@ apply_overrides() {
   [ -n "${OPT_CONTAINER_RUNTIME:-}" ] && P_CONTAINER_RUNTIME=$OPT_CONTAINER_RUNTIME
   [ -n "${OPT_PODMAN_SERVICES:-}" ] && P_PODMAN_SERVICES=$OPT_PODMAN_SERVICES
   [ -n "${OPT_DOCKER_HOST_PODMAN:-}" ] && P_DOCKER_HOST_PODMAN=$OPT_DOCKER_HOST_PODMAN
+  # Parity keys. PRESET is not folded here: presets_resolve (lib/presets.sh) combines the profile's PRESET and
+  # C101_PACKS with --preset/--pick-preset/--packs (a command-line selection replaces the profile's, D9).
+  [ -n "${OPT_KEYS:-}" ] && P_KEYS=$OPT_KEYS
+  [ -n "${OPT_IMAGE_BACKEND:-}" ] && P_IMAGE_BACKEND=$OPT_IMAGE_BACKEND
+  [ -n "${OPT_FAL_MCP:-}" ] && P_FAL_MCP=$OPT_FAL_MCP
+  [ -n "${OPT_PREWARM_MCP:-}" ] && P_PREWARM_MCP=$OPT_PREWARM_MCP
+  [ -n "${OPT_PLAYWRIGHT_BROWSER:-}" ] && P_PLAYWRIGHT_BROWSER=$OPT_PLAYWRIGHT_BROWSER
+  [ -n "${OPT_LEARN_TIMER:-}" ] && P_LEARN_TIMER=$OPT_LEARN_TIMER
   [ "${OPT_NO_SUDO:-}" = 1 ] && P_NO_SUDO=1
   [ "${OPT_YES:-}" = 1 ] && P_ASSUME_YES=1
   NO_SUDO=$P_NO_SUDO
@@ -91,4 +115,15 @@ print_config() {
   printf 'MANAGED_SETTINGS=%s\n' "${OPT_MANAGED_SETTINGS:-0}"
   printf 'NO_SUDO=%s\n' "$NO_SUDO"
   printf 'ASSUME_YES=%s\n' "$ASSUME_YES"
+  # Parity keys: the resolved preset and packs (presets_resolve plus the fal image preset; PACKS=all means every
+  # pack), the key step's inputs and the opt-in steps. Names and fixed words only, never a key value.
+  printf 'PRESET=%s\n' "${PRESET_RESOLVED-}"
+  if [ "${PRESET_ALL:-1}" = 1 ]; then printf 'PACKS=all\n'; else printf 'PACKS=%s\n' "${PRESET_PACKS-}"; fi
+  printf 'KEYS=%s\n' "${KEYS:-${P_KEYS:-0}}"
+  printf 'KEYS_OVERWRITE=%s\n' "${KEYS_OVERWRITE:-0}"
+  printf 'IMAGE_BACKEND=%s\n' "${IMAGE_BACKEND:-${P_IMAGE_BACKEND:-keep}}"
+  printf 'FAL_MCP=%s\n' "$P_FAL_MCP"
+  printf 'PREWARM_MCP=%s\n' "$P_PREWARM_MCP"
+  printf 'PLAYWRIGHT_BROWSER=%s\n' "$P_PLAYWRIGHT_BROWSER"
+  printf 'LEARN_TIMER=%s\n' "$P_LEARN_TIMER"
 }

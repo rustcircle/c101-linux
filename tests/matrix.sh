@@ -7,7 +7,12 @@
 #   C101_SRC=/path/to/c101 tests/matrix.sh           another c101 checkout
 # The c101 checkout and this repository are mounted READ-ONLY; c101's installer needs a writable tree (it creates
 # .venv and restores executable bits), so each container works on a copy without .venv, .git and .stack.
-# Per image: install (--profile ci), second install (idempotence), doctor, dry-run on a fresh copy (no changes).
+# Per image: install (--profile ci), second install (idempotence), key hygiene, doctor, dry-run on a fresh copy (no changes),
+# uninstall (the keys file stays).
+# Keys: the run carries FAKE key values (FAL_KEY, EXA_API_KEY, JINA_API_KEY, SPIDER_API_KEY; fixed strings below, never a
+# real key and never read from your environment). They exercise the key step and satisfy the doctor's FAIL rules for a
+# missing key, which would otherwise fail every profile but ci (MATRIX_PROFILE=standard tests/matrix.sh). MATRIX_FAKE_KEYS=0
+# runs without any, to see the unattended no-key path (warnings, no failure in ci).
 # Output: a PASS/FAIL/SKIP table and one log per image under .stack/out/matrix/<timestamp>/. Exit 1 on any FAIL.
 set -Eeuo pipefail
 
@@ -17,6 +22,18 @@ C101_SRC=${C101_SRC:-$root/../c101}
 DEFAULT_IMAGES=(ubuntu:24.04 ubuntu:22.04 debian:12 fedora:41 archlinux:latest alpine:3.20)
 PROFILE=${MATRIX_PROFILE:-ci}
 TIMEOUT=${MATRIX_TIMEOUT:-1800}
+# Fixed fake values, all starting with the prefix the key-hygiene step greps for. They are constants on purpose: a value
+# from the caller's environment (a real FAL_KEY, say) must never be forwarded into a container.
+FAKE_KEYS=${MATRIX_FAKE_KEYS:-1}
+fake_env=()
+if [ "$FAKE_KEYS" = 1 ]; then
+  fake_env=(
+    -e FAL_KEY=c101l-matrix-fake-fal-not-a-key
+    -e EXA_API_KEY=c101l-matrix-fake-exa-not-a-key
+    -e JINA_API_KEY=c101l-matrix-fake-jina-not-a-key
+    -e SPIDER_API_KEY=c101l-matrix-fake-spider-not-a-key
+  )
+fi
 
 case $RT in podman | docker) ;; *)
   echo "CONTAINER_RUNTIME must be podman or docker" >&2
@@ -68,17 +85,31 @@ find /home/tester \( $P \) -prune -o -print | sort
 find /home/tester \( $P \) -prune -o -type f -exec cksum {} + | sort
 SNAP
 chmod 755 /home/tester/snap.sh
-run_as() { su tester -s /bin/bash -c "export HOME=/home/tester USER=tester PROFILE='$PROFILE' && cd /home/tester && $1"; }
+keyenv=""
+for n in FAL_KEY EXA_API_KEY JINA_API_KEY SPIDER_API_KEY; do
+  eval "v=\${$n:-}"
+  if [ -n "$v" ]; then keyenv="$keyenv $n='$v'"; fi
+done
+run_as() { su tester -s /bin/bash -c "export HOME=/home/tester USER=tester PROFILE='$PROFILE'$keyenv && cd /home/tester && $1"; }
 echo "### install"
 run_as '/home/tester/overlay/install-linux.sh --profile "$PROFILE" --source /home/tester/c101 --yes'
 echo "### install again (idempotence)"
 run_as '/home/tester/overlay/install-linux.sh --profile "$PROFILE" --source /home/tester/c101 --yes'
+if [ -n "$keyenv" ]; then
+  echo "### keys: stack.env is mode 600 and holds no key outside it"
+  run_as 'test "$(stat -c %a /home/tester/.claude/stack.env)" = 600'
+  # every fake value starts with c101l-matrix-fake: the key step, the login profile, environment.d, units, the settings
+  # file and the fal-runner agent must not carry one (only stack.env and its backups may)
+  run_as 'for p in .profile .bash_profile .bash_login .zprofile .config .local/state .local/bin .claude/settings.json .claude/agents/fal-runner.md; do if [ -e "$p" ] && grep -rqF -e c101l-matrix-fake -- "$p"; then echo "a key value was written to $p" >&2; exit 1; fi; done'
+fi
 echo "### doctor"
-run_as '/home/tester/overlay/bin/c101-linux-doctor --profile "$PROFILE" --skip-c101'
+run_as '/home/tester/overlay/bin/c101-linux-doctor --profile "$PROFILE" --skip-c101 --offline'
 echo "### dry run changes nothing"
 run_as '/home/tester/snap.sh > /tmp/before.txt; /home/tester/overlay/install-linux.sh --profile full --dry-run --source /home/tester/c101-dry >/dev/null; /home/tester/snap.sh > /tmp/after.txt; diff /tmp/before.txt /tmp/after.txt'
 echo "### uninstall"
 run_as '/home/tester/overlay/uninstall-linux.sh --yes'
+echo "### the keys file survives the uninstall"
+run_as 'test -f /home/tester/.claude/stack.env'
 echo "### done"
 INNER_EOF
 
@@ -99,8 +130,14 @@ for image in "${images[@]}"; do
   fi
   start=$(date +%s)
   if timeout "$TIMEOUT" "$RT" run --rm ${platform_args[@]+"${platform_args[@]}"} "${mounts[@]}" \
-    -e C101L_UV_VERSION="${C101L_UV_VERSION:-}" "$image" sh -c "PROFILE=$PROFILE; $inner" >>"$log" 2>&1; then
-    printf '%-18s %-6s %s\n' "$image" PASS "$(($(date +%s) - start))s" | tee -a "$out/summary.txt"
+    -e C101L_UV_VERSION="${C101L_UV_VERSION:-}" ${fake_env[@]+"${fake_env[@]}"} "$image" sh -c "PROFILE=$PROFILE; $inner" >>"$log" 2>&1; then
+    # Key values are never printed: not by the installer, the doctor, the dry run or the uninstaller.
+    if [ "$FAKE_KEYS" = 1 ] && grep -qF c101l-matrix-fake "$log"; then
+      fails=$((fails + 1))
+      printf '%-18s %-6s %s\n' "$image" FAIL "a fake key value appeared in the output (see $slug.log); only key names may be printed" | tee -a "$out/summary.txt"
+    else
+      printf '%-18s %-6s %s\n' "$image" PASS "$(($(date +%s) - start))s" | tee -a "$out/summary.txt"
+    fi
   else
     rc=$?
     fails=$((fails + 1))
@@ -109,5 +146,5 @@ for image in "${images[@]}"; do
 done
 
 echo
-echo "runtime: $RT   profile: $PROFILE   logs: $out"
+echo "runtime: $RT   profile: $PROFILE   fake keys: $([ "$FAKE_KEYS" = 1 ] && echo yes || echo no)   logs: $out"
 [ "$fails" -eq 0 ]

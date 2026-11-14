@@ -7,8 +7,11 @@
   jsontool.py get FILE KEY                     print a dotted key (exit 1 when missing)
   jsontool.py strip-keys FILE KEY... [--dry-run]  delete top-level keys; removes FILE when it ends up empty (backup first)
   jsontool.py has-keys FILE KEY...             print the JSON list of those top-level keys that exist
-  jsontool.py env-snapshot FILE                print the "env" object (or {})
-  jsontool.py strip-env FILE SOURCE BEFORE [--dry-run]  drop env keys c101 added (see strip_env)
+  jsontool.py env-snapshot FILE                print the sorted NAMES of the "env" object as a JSON list (or []; never values)
+  jsontool.py env-names -                      stdin: a JSON list or object (an older state's snapshot); print its sorted names
+  jsontool.py strip-env FILE SOURCE BEFORE [--dry-run]  drop env keys c101 added (see strip_env); BEFORE is a JSON list
+                                               of names (an older state's object works too, its keys count), or - to read it
+                                               from stdin so no value ever sits on a command line
 Writes go through symlinks and refuse /nix/store targets.
 """
 from __future__ import annotations
@@ -28,6 +31,15 @@ def load(path: str) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("top level is not an object")
     return data
+
+
+def env_names(snapshot: Any) -> List[str]:
+    """The key names of an env snapshot: a list of names (current state files) or an object (older ones: only its keys count)."""
+    if isinstance(snapshot, dict):
+        return sorted(str(k) for k in snapshot)
+    if isinstance(snapshot, list):
+        return sorted(str(k) for k in snapshot)
+    return []
 
 
 def count_hooks(data: Dict[str, Any], mark: str) -> int:
@@ -90,6 +102,13 @@ def main(argv: List[str]) -> int:
     if len(argv) < 2:
         raise SystemExit(__doc__)
     cmd, path = argv[0], argv[1]
+    if cmd == "env-names":
+        try:
+            print(json.dumps(env_names(json.loads(sys.stdin.read() or "[]"))))
+        except ValueError as exc:
+            print("invalid JSON on stdin: %s" % exc, file=sys.stderr)
+            return 2
+        return 0
     try:
         data = load(path)
     except FileNotFoundError:
@@ -115,8 +134,8 @@ def main(argv: List[str]) -> int:
         print(json.dumps([k for k in argv[2:] if k in data]))
         return 0
     if cmd == "env-snapshot":
-        env = data.get("env")
-        print(json.dumps(env if isinstance(env, dict) else {}))
+        # Names only (R3): a token in the user's env must never be copied into state.json or onto a command line.
+        print(json.dumps(env_names(data.get("env"))))
         return 0
     dry = "--dry-run" in argv
     if cmd == "strip-hooks":
@@ -137,7 +156,8 @@ def main(argv: List[str]) -> int:
     if cmd == "strip-env":
         # strip-env SETTINGS SOURCE_SETTINGS BEFORE_JSON [--dry-run]: remove the env keys c101 merged in (those of
         # SOURCE_SETTINGS' env) that were not there before c101 ran (BEFORE_JSON) and still hold c101's value.
-        removed = strip_env(data, load(argv[2]).get("env") or {}, json.loads(argv[3]))
+        before_raw = sys.stdin.read() if argv[3] == "-" else argv[3]
+        removed = strip_env(data, load(argv[2]).get("env") or {}, env_names(json.loads(before_raw)))
         if removed and not dry:
             commit(path, data, delete_if_empty=False)
         print(json.dumps({"removed": removed}))
@@ -145,11 +165,13 @@ def main(argv: List[str]) -> int:
     raise SystemExit("unknown command %s" % cmd)
 
 
-def strip_env(data: Dict[str, Any], source_env: Dict[str, Any], before: Dict[str, Any]) -> List[str]:
+def strip_env(data: Dict[str, Any], source_env: Dict[str, Any], before: Any) -> List[str]:
+    """before: the names (a list, or an older state's object whose keys count) the user's env held before c101 ran."""
     env = data.get("env")
     if not isinstance(env, dict):
         return []
-    removed = [k for k, v in source_env.items() if k not in before and k in env and env[k] == v]
+    before_names = set(env_names(before))
+    removed = [k for k, v in source_env.items() if k not in before_names and k in env and env[k] == v]
     for k in removed:
         del env[k]
     if not env:

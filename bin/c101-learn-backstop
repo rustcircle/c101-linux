@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# c101-linux managed file
+# c101-learn-backstop: runs c101's learner for Claude Code sessions whose SessionEnd hook never ran (a Desktop quit,
+# a logout that killed the session scope, a crash). Installed as ~/.local/bin/c101-learn-backstop and started every
+# 30 minutes by c101-learn-backstop.timer (opt-in: LEARN_TIMER=1, on in the standard, full and headless profiles).
+#
+# Why: c101 writes a session's statistics (stack-data/history.jsonl) and, with apply_on "session_end", the learned
+# maxTurns/effort values only in `stack learn run`, which only the SessionEnd hook starts. A session that ends without
+# SessionEnd loses its history row and its final apply until another session's SessionEnd happens to run.
+#
+# Per run:
+#   candidates  ${CLAUDE_PROJECTS_ROOT:-~/.claude/projects}/*/*.jsonl modified within the last 3 days and more than
+#               30 minutes ago (younger ones may belong to a live session), oldest first;
+#   skipped     a transcript whose ${CLAUDE_STACK_DATA:-~/.claude/stack-data}/obs/<stem>.json is newer than it (a
+#               learn run already ingested it), and one this backstop already ran on since its last change (stamp
+#               under ${XDG_STATE_HOME:-~/.local/state}/c101-linux/learn-backstop/: a session with nothing to ingest
+#               never gets an obs file and would otherwise be re-run, and could crowd out real ones, every 30 minutes);
+#   action      at most 20 per run:  $HOME/.claude/stack/bin/stack learn run --transcript P
+# Only `learn run` is used: it takes stack-data/learn.lock itself and is idempotent (it rewrites the session's obs file
+# and replaces its history line), so racing a real SessionEnd is safe. The separate ingest, update and apply
+# subcommands are never called: they take no lock. learn run honours apply_on/auto_apply like the SessionEnd run.
+# The main thread is attributed like the in-session run: CLAUDE_STACK_MAIN_AGENT from the session's earlier obs file
+# (e.g. delegator under bin/claude-stack), else the inherited value, else c101's default "main".
+# Output of learn run is appended to stack-data/learn.log (the SessionEnd hook's log); a summary goes to stdout
+# (journalctl --user -u c101-learn-backstop).
+#
+# Linux only (GNU find). Usage: c101-learn-backstop [--dry-run] [--help]
+#   --dry-run   list what would run; runs nothing and writes nothing.
+# Test knobs (environment): C101_LEARN_BACKSTOP_MAX (20), C101_LEARN_BACKSTOP_MIN_AGE_MIN (30),
+# C101_LEARN_BACKSTOP_MAX_AGE_DAYS (3).
+set -euo pipefail
+
+prog=${0##*/}
+dry=0
+case ${1:-} in
+  '') ;;
+  -n | --dry-run) dry=1 ;;
+  -h | --help)
+    sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    echo "$prog: unknown argument '$1' (try --help)" >&2
+    exit 2
+    ;;
+esac
+
+uint_or() { # uint_or VALUE DEFAULT: VALUE when it is a positive integer, else DEFAULT
+  if [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]; then printf '%s\n' "$1"; else printf '%s\n' "$2"; fi
+}
+max_runs=$(uint_or "${C101_LEARN_BACKSTOP_MAX:-}" 20)
+min_age_min=$(uint_or "${C101_LEARN_BACKSTOP_MIN_AGE_MIN:-}" 30)
+max_age_days=$(uint_or "${C101_LEARN_BACKSTOP_MAX_AGE_DAYS:-}" 3)
+
+home=${HOME:?HOME is not set}
+stack=$home/.claude/stack/bin/stack
+projects=${CLAUDE_PROJECTS_ROOT:-$home/.claude/projects}
+data=${CLAUDE_STACK_DATA:-$home/.claude/stack-data}
+stamps=${XDG_STATE_HOME:-$home/.local/state}/c101-linux/learn-backstop
+
+# GNU find is required (-printf below). BusyBox find (Alpine's default, e.g. under the OpenRC cron fallback) rejects
+# -printf: without this probe every run would quietly report "0 transcript(s)" and learn nothing.
+probe_rc=0
+probe=$(find "$home" -maxdepth 0 -printf 'ok' 2>&1) || probe_rc=$?
+if [ "$probe_rc" -ne 0 ] || [ "$probe" != ok ]; then
+  if [ -n "$probe" ]; then printf '%s\n' "$probe" >&2; fi # find's own message
+  echo "$prog: this find does not support -printf (BusyBox find?): install GNU findutils (Alpine: apk add findutils), then run it again" >&2
+  exit 1
+fi
+
+if [ ! -x "$stack" ]; then
+  echo "$prog: c101 is not installed ($stack missing); nothing to do"
+  exit 0
+fi
+if [ ! -d "$projects" ]; then
+  echo "$prog: no transcripts yet ($projects missing); nothing to do"
+  exit 0
+fi
+
+# main_agent_of OBS: the main thread's agent type that an earlier in-session ingest recorded (it saw the session's
+# CLAUDE_STACK_MAIN_AGENT). Without it a re-ingest would relabel those runs as "main". c101 writes obs files with
+# json.dump(indent=2, sort_keys=True): the "main" record is a 2-space key, its fields 4-space keys.
+main_agent_of() {
+  [ -r "$1" ] || return 0
+  awk '
+    /^  "main": \{/ { m = 1; next }
+    m && /^  [^ ]/ { exit }
+    m && /^    "agent_type": "/ { sub(/^    "agent_type": "/, ""); sub(/",?[[:space:]]*$/, ""); print; exit }
+  ' "$1" 2>/dev/null || true
+}
+
+if [ "$dry" != 1 ]; then
+  mkdir -p -- "$stamps" "$data"
+  # Stamps carry their transcript's mtime; past the look-back window they can never match again.
+  find "$stamps" -maxdepth 1 -type f -name '*.done' -mtime +"$max_age_days" -delete 2>/dev/null || true
+fi
+
+found=0 ran=0 learned=0 done_before=0 failed=0 capped=0
+while IFS=$'\t' read -r -d '' _ t; do
+  [ -n "$t" ] || continue
+  found=$((found + 1))
+  stem=${t##*/}
+  stem=${stem%.jsonl}
+  obs=$data/obs/$stem.json
+  stamp=$stamps/$stem.done
+  # Skip when the obs file is newer than the transcript: a learn run (SessionEnd or this backstop) already ingested it.
+  if [ "$obs" -nt "$t" ]; then
+    learned=$((learned + 1))
+    continue
+  fi
+  # Skip when this backstop already ran on this version of the transcript (stamp mtime == transcript mtime).
+  if [ -e "$stamp" ] && ! [ "$t" -nt "$stamp" ]; then
+    done_before=$((done_before + 1))
+    continue
+  fi
+  if [ "$ran" -ge "$max_runs" ]; then
+    capped=$((capped + 1))
+    continue
+  fi
+  main=$(main_agent_of "$obs")
+  [[ $main =~ ^[A-Za-z0-9._:-]+$ ]] || main=${CLAUDE_STACK_MAIN_AGENT:-main}
+  if [ "$dry" = 1 ]; then
+    ran=$((ran + 1))
+    printf 'would run: CLAUDE_STACK_MAIN_AGENT=%s %s learn run --transcript %s\n' "$main" "$stack" "$t"
+    continue
+  fi
+  # The stamp takes the transcript's mtime before the run, so a write during the run still counts as a change.
+  touch -r "$t" -- "$stamp.new" 2>/dev/null || continue # the transcript vanished since find saw it
+  ran=$((ran + 1))
+  rc=0
+  {
+    printf '[%s] c101-learn-backstop: learn run --transcript %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$t"
+    CLAUDE_STACK_MAIN_AGENT=$main "$home"/.claude/stack/bin/stack learn run --transcript "$t" </dev/null
+  } >>"$data/learn.log" 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    mv -f -- "$stamp.new" "$stamp"
+    echo "learned: $stem (main thread: $main)"
+  else
+    rm -f -- "$stamp.new"
+    failed=$((failed + 1))
+    echo "$prog: learn run failed (exit $rc) for $t; details in $data/learn.log" >&2
+  fi
+# find's stderr goes to the journal (an unreadable project directory, a transcript that vanished mid-scan).
+done < <(find "$projects" -mindepth 2 -maxdepth 2 -type f -name '*.jsonl' \
+  -mmin -"$((max_age_days * 1440))" -mmin +"$min_age_min" -printf '%T@\t%p\0' | sort -z -n)
+
+verb=ran
+[ "$dry" = 1 ] && verb="would run"
+echo "$prog: $found transcript(s) from the last ${max_age_days}d older than ${min_age_min}min: $verb $ran," \
+  "already learned $learned, already backstopped $done_before, failed $failed, left for the next run $capped (cap $max_runs)"
+[ "$failed" -eq 0 ]

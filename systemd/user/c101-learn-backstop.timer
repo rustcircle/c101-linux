@@ -1,0 +1,12 @@
+# c101-linux managed unit
+[Unit]
+Description=Every 30 minutes: c101 learning backstop for sessions that ended without SessionEnd
+
+[Timer]
+OnCalendar=*:0/30
+RandomizedDelaySec=120
+Persistent=true
+Unit=c101-learn-backstop.service
+
+[Install]
+WantedBy=timers.target

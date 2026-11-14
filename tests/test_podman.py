@@ -32,7 +32,9 @@ class UnitFileTests(unittest.TestCase):
         files = sorted(UNITS.iterdir())
         self.assertEqual({f.name for f in files}, {
             "c101-podman-api.socket", "c101-podman-api.service", "c101-sandbox-image.service",
-            "c101-sandbox-image.timer", "c101-podman-prune.service", "c101-podman-prune.timer"})
+            "c101-sandbox-image.timer", "c101-podman-prune.service", "c101-podman-prune.timer",
+            # the learning backstop (lib/learning.sh): a service run by a timer, installed by the installer's own step
+            "c101-learn-backstop.service", "c101-learn-backstop.timer"})
         for f in files:
             text = f.read_text(encoding="utf-8")
             self.assertEqual(text.splitlines()[0], "# c101-linux managed unit", f.name)
@@ -48,9 +50,9 @@ class UnitFileTests(unittest.TestCase):
 
     def test_install_targets(self) -> None:
         self.assertEqual(parse(UNITS / "c101-podman-api.socket")["Install"]["WantedBy"], "sockets.target")
-        for t in ("c101-sandbox-image.timer", "c101-podman-prune.timer"):
+        for t in ("c101-sandbox-image.timer", "c101-podman-prune.timer", "c101-learn-backstop.timer"):
             self.assertEqual(parse(UNITS / t)["Install"]["WantedBy"], "timers.target")
-        for s in ("c101-podman-api.service", "c101-sandbox-image.service", "c101-podman-prune.service"):
+        for s in ("c101-podman-api.service", "c101-sandbox-image.service", "c101-podman-prune.service", "c101-learn-backstop.service"):
             self.assertNotIn("Install", parse(UNITS / s), "%s is started by its socket/timer, not enabled" % s)
 
     def test_socket_and_service_pair_up(self) -> None:
@@ -66,7 +68,15 @@ class UnitFileTests(unittest.TestCase):
         for t in UNITS.glob("*.timer"):
             cp = parse(t)
             self.assertTrue((UNITS / cp["Timer"]["Unit"]).exists(), t.name)
-            self.assertEqual(cp["Timer"]["OnCalendar"], "weekly")
+            if t.name == "c101-learn-backstop.timer":
+                continue  # a backstop for missed SessionEnd runs, not weekly housekeeping: see the next test
+            self.assertEqual(cp["Timer"]["OnCalendar"], "weekly", t.name)
+
+    def test_the_learning_backstop_timer_is_the_only_one_that_is_not_weekly(self) -> None:
+        timers = {t.name: parse(t)["Timer"]["OnCalendar"] for t in UNITS.glob("*.timer")}
+        self.assertEqual(sorted(n for n, cal in timers.items() if cal != "weekly"), ["c101-learn-backstop.timer"])
+        self.assertRegex(timers["c101-learn-backstop.timer"], r"^\*:(0|00)/30$", "every 30 minutes, on the half hour")
+        self.assertEqual(parse(UNITS / "c101-learn-backstop.timer")["Timer"]["Persistent"], "true")
 
     def test_sandbox_unit_path_covers_nixos_and_linuxbrew(self) -> None:
         text = (UNITS / "c101-sandbox-image.service").read_text()

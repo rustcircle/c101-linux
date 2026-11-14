@@ -125,3 +125,144 @@ omit unavailable limits with a stderr warning instead of failing every `sandbox_
 `install.sh:32-36` runs `uv python install 3.13`, and `stack/install.py` writes `UV_PYTHON_PREFERENCE=only-managed` into `~/.claude/settings.json`; both need a dynamically linked
 Python that stock NixOS refuses to run without `programs.nix-ld.enable`. Suggested: honour an existing interpreter when `UV_PYTHON_DOWNLOADS=never` is set, and document nix-ld in
 `docs/reference/installation.md`. Overlay: preflight (`nixos_check`) requires nix-ld and nixpkgs' uv.
+
+Items 13 to 26 come from the parity change of 2026-11-14 (keys, fal, presets, MCP start-up, learning backstop), at the same
+c101 commit `7b37043`. Items 22 and 23 are cross-references from the overlay's security review of its key handling; c101's
+own code was read for them, not reviewed in full.
+
+## 13. Playwright MCP has no `--browser` on Linux (P1)
+
+`config/mcp.servers.json:4-15` starts `npx -y @playwright/mcp@latest --headless --isolated ...` with no browser setting, and
+`bin/stack mcp sync` renders that into every agent that uses it. @playwright/mcp then uses the Chrome channel, which most Linux
+hosts lack and arm64 Linux never has ("Chromium distribution 'chrome' is not found"). The server is started by `npx` directly,
+not through `bin/mcp-run`, so a `PLAYWRIGHT_MCP_BROWSER` line in `stack.env` would not reach it either.
+Suggested: start it through a small launcher (like `bin/neural-memory-mcp`) that adds `--browser chromium` on Linux unless
+`PLAYWRIGHT_MCP_BROWSER` is set (`chromium` is Playwright's own Chrome for Testing build), and install the matching browser at
+user level: `npx -y "playwright-core@$(npm view @playwright/mcp@latest dependencies.playwright-core)" install --no-shell chromium`
+(no root; the system libraries stay a separate root step). Overlay: `PLAYWRIGHT_MCP_BROWSER=chromium` in the login-profile block
+and `environment.d` (`lib/pathprofile.sh`), `--browser chromium` in `config/desktop-mcp.json`, `--playwright-browser`
+(`lib/prewarm.sh`); PITFALLS 43.
+
+## 14. Keys the stack reads but `stack keys` does not list (P3)
+
+`config/policy.json:11-43` (`optional_keys`) lists the image keys, `CONTEXT7_API_KEY`, `FIRECRAWL_API_KEY`, `TAVILY_API_KEY` and
+`BRAVE_API_KEY`, but not `FAL_KEY` (read by `bin/mcp-headers:52`), `REPLICATE_API_TOKEN` (`config/mcp.optional.json:23`) or
+`RUNWARE_API_KEY` (`config/mcp.optional.json:43`, `config/stack.env.example:99`), so `bin/stack keys` (`stack/cli.py:164-179`)
+never reports them. Suggested: add the three names. Overlay: the doctor reports `FAL_KEY` by name (`keys-image`, `fal-runner`).
+
+## 15. `stack doctor` checks neither keys nor image operations (P2)
+
+`stack/cli.py:145-161` runs `stack/doctor.py`, which never calls `envfile.missing` or the image router's status
+(`stack_mcp/image_router/server.py:206-219`, the `--check` output). A user without a fal key gets a clean doctor and an image
+server without tools. Suggested: a doctor section that prints the `stack keys` result (names only) and one line per image
+operation from `status_lines()`. Overlay: `bin/c101-linux-doctor` sections "Image generation (fal)" and "Research servers".
+
+## 16. Spawn budget: the docs say 128, the policy says 256 (P3)
+
+`docs/DEPTH.md:23` says `max_spawns_per_session` defaults to 128; `config/policy.json:3` sets 256, and the code default when the
+key is missing is 0, no budget (`stack/hooks.py:235`). Suggested: "256 in config/policy.json; no limit when the key is absent".
+
+## 17. Stray `stack_sdk/options(1).py` (P3)
+
+A second copy of `stack_sdk/options.py` with different content and a browser-download name. Nothing imports it (a module name
+with parentheses cannot be imported), and the parentheses trip shell globs and some packaging tools. Suggested: delete it.
+
+## 18. `learn ingest`, `update` and `apply` run without `learn.lock` (P2)
+
+`stack/cli.py:184-200`: only `learn run` (`:201-206`) and the hooks (`stack/hooks.py:473`, `:531`) take
+`stack-data/learn.lock`. A hand-run `bin/stack learn apply` (or the stack-tuner agent) can interleave with a detached SessionEnd
+`learn run` on `recommendations.json`, `changes.jsonl` and the agent files. Suggested: take the same lock in all three (block, or
+fail fast with a message). Overlay: the learning backstop calls only `learn run`.
+
+## 19. No key step in the installer, and the fal preset repeats the key per operation (P2)
+
+`stack/install.py:360-379` has no key or image-backend option; `base()` (`:84-95`) only copies `config/stack.env.example` and says
+"fill in your keys". `config/stack.env.fal.example` repeats `your-fal-key` for nine operations (`:33`, `:44`, `:56`, `:66`, `:73`,
+`:80`, `:88`, `:102`, `:113`) and has a separate `FAL_KEY=` (`:122`), because none of the four readers (`stack/envfile.py`,
+`bin/mcp-run`, `bin/mcp-headers`, `stack_mcp/image_router/config.py`) expands variables; rotating a key means editing ten lines.
+Suggested: let the router fall back to `FAL_KEY` when an operation's URL host is `queue.fal.run` and its KEY is empty, so one line
+holds the key; and an installer option that merges the fal preset with one hidden prompt (stdin only, symlink-aware atomic write,
+backup first). Overlay: `lib/stackenv.py merge --preset` and `lib/keys.sh` (`--keys`, `--keys-from-env`, `--keys-only`,
+`--keys-overwrite`, `--image-backend`); PITFALLS 46 to 48.
+
+## 20. `bin/stack mcp enable` works at project scope only (P2)
+
+`stack/cli.py:332-381` writes `.mcp.json` and `.claude/settings.json` inside the checkout. After `install.sh --user` the checkout
+is `~/.claude/stack`, so `bin/stack mcp enable fal`, which `config/stack.env.example:93` recommends, edits tracked files, and the
+server appears only in sessions whose project is the checkout. Suggested: `--scope user` that goes through `_register_user_mcp`
+(`stack/install.py:199`) with the `_user_mcp_entry` path rewrite, or an agent that carries the server inline (item 21).
+Overlay: the `fal-runner` agent and `~/.config/c101/fal-mcp.json`; PITFALLS 52.
+
+## 21. Registrations c101 would need for an agent like `fal-runner` (P2)
+
+The overlay ships `agents/fal-runner.md` (c101's conventions, the frontmatter order of `image-editor`) and changes nothing in c101.
+To make it a first-class agent c101 would need:
+* `config/models.json`, next to `image-editor` (`:288`): `"fal-runner": {"tier": "MEDIUM_MODEL", "effort": "medium",
+  "maxTurns": 120, "why": "fal model catalog, video, audio and 3D runs and jobs through the hosted fal MCP"}`. Without it
+  `bin/stack agents tiers --apply` does not manage its model (the file names `claude-sonnet-5-5`).
+* `config/learning.json` `agents` (`:60`): `"fal-runner": {"maxTurns": [30, 300], "effort": ["low", "high"]}`. Without it the
+  learner applies `default_bounds` (`:45`: maxTurns 5 to 1000, effort up to max) to an agent that spends money per call, and
+  writes the result into the overlay's file (PITFALLS 59).
+* `config/policy.json` `spawn_rules.callers` (`:82`): `"fal-runner": ["file-summarizer", "quick-researcher", "visual-reviewer"]`,
+  like the `image-editor` row (`:113`); callers that are not listed may spawn anything.
+* A routing row and roster entries in `.claude/agents/orchestration/delegator.md` (`:65`, `:141`) and the orchestrator's roster,
+  so requests for video, audio or 3D reach it, and a row in `docs/AGENTS.md` (`:25` is the `image-editor` row).
+* A `fal` server in `config/mcp.servers.json` (with the fixed helper path of item 22), so `bin/stack mcp sync` and the doctor's
+  drift check know the inline copy; today neither does.
+
+## 22. Helpers and launchers look for `bin/` in the project directory (P2, security)
+
+`config/mcp.servers.json:20`, `:25`, `:30`, `:35` (and the stdio launchers, such as `:42`) render
+`d="${CLAUDE_PROJECT_DIR:-$PWD}"; [ -x "$d/bin/mcp-headers" ] || d="$HOME/.claude/stack"; exec "$d/bin/mcp-headers" exa` into
+about 30 agent files. It serves work inside the c101 checkout, but a `--user` install links the same agents into
+`~/.claude/agents`, and then the helper runs any executable `bin/mcp-headers` (or `bin/mcp-run`) of the directory it resolves to,
+with full access to `stack.env`. The overlay's security review rated it Low for linked agents on current Claude Code (their
+helpers run in `~/.claude`, and `CLAUDE_PROJECT_DIR` is not documented for them) and Medium for a `--mcp-config` file, whose helper
+runs in the session's working directory. Not settled: whether `CLAUDE_PROJECT_DIR` is inherited (a nested `claude` started from a
+hook), and which working directory an agent's stdio servers get (*unverified*). `_user_mcp_entry` (`stack/install.py:191-196`)
+rewrites `${CLAUDE_PROJECT_DIR:-$HOME/.claude/stack}` to the absolute link for user scope, but not this form.
+Suggested: render user-scope agents with a fixed path (`exec "$HOME/.claude/stack/bin/mcp-headers" exa`), or use the project's
+`bin/` only when it is the stack checkout itself (`[ "$d" -ef "$HOME/.claude/stack" ]`). Overlay: `config/fal-mcp.json` and
+`agents/fal-runner.md` both use the fixed path (the install is always user level, so the agent never needs a project's `bin/`).
+
+## 23. `bin/mcp-run` exports every name in `stack.env` and trusts the file (P2, security)
+
+`bin/mcp-run:34-55` exports every `NAME=value` line (any name matching `:42`) into the server's environment unless `--only`
+limits it, so `LD_PRELOAD`, `NODE_OPTIONS`, `PYTHONSTARTUP`, `BASH_ENV` or `PATH` in the file means code execution in every stdio
+server. Neither `bin/mcp-run` (`:34`) nor `bin/mcp-headers` (`:18`) checks that the file is owned by the user and not writable by
+others, so whoever controls the file or its directory (a `CLAUDE_STACK_ENV` in a shared directory, a link into a group-writable
+tree) controls the servers. The readers also disagree on duplicates: `bin/mcp-run` keeps the first non-empty assignment (`:52`),
+while `bin/mcp-headers` (`:15-37`, whose comment promises the same rules) and `stack/envfile.py` take the last; and in
+`bin/mcp-run` a variable already in the environment beats the file unless `STACK_ENV_OVERRIDE=1`.
+Suggested: `--only` with the server's own names for every launch, or at least a deny-list (`LD_*`, `DYLD_*`, `NODE_OPTIONS`,
+`PYTHON*`, `BASH_ENV`, `ENV`, `PATH`, `HOME`); refuse a file or directory that another account owns or can write; one duplicate
+rule in all four readers. Overlay: `lib/stackenv.py` reports directory problems, keeps one assignment per name, checks that every
+value reads back identically under all four readers, and tightens the mode to 600; PITFALLS 45, 57.
+
+## 24. `install.py` runs `base()` on every invocation, undo flags included (P2)
+
+`stack/install.py:389` calls `base()` (`:84-95`) before any flag is looked at, so the undo flags `--no-main-agent`,
+`--no-enforce-models` and `--no-python-default` relink `~/.claude/stack`, create `~/.claude/stack.env` from the template when it is
+missing and create `~/.claude/stack-data`. An uninstaller that lets c101 undo its settings therefore recreates a keys file the user
+removed. `base()` also ignores `CLAUDE_STACK_ENV`: it creates and tightens only `~/.claude/stack.env` (`:86`), while every reader
+honours the variable (`stack/envfile.py:19`). Suggested: skip `base()` when only undo flags are given (no `--user`, `--mcp` or
+`--adobe`), and use `envfile.env_path()`. Overlay: `uninstall-linux.sh` skips the c101 reversal when `~/.claude/stack.env` is
+missing and prints the manual undo; PITFALLS 58.
+
+## 25. The learner rewrites tracked files in the checkout (P3)
+
+`stack/learn/engine.py:342-391` writes recommendations into agent frontmatter, `stack/frontmatter.py:142-153` follows links to
+their target, and `stack/paths.py:22-34` also searches `~/.claude/agents`. Consequences: a git checkout that is always dirty
+(`git pull` refuses), silent failure on a read-only checkout (only `stack-data/hook-errors.log` or `learn.log` say so), and overlay
+agents such as `fal-runner` tuned with default bounds and rewritten inside another repository. Suggested: keep learned values in
+`stack-data` and apply them when agents are rendered or linked, or limit `apply` to files under the checkout plus agents listed in
+`config/learning.json`; report failed writes in `stack doctor`. Overlay: doctor `learning-writable`; PITFALLS 49, 59.
+
+## 26. Smaller notes (keys and session hooks)
+
+* `stack/hooks.py:546`: the SessionStart line always names `~/.claude/stack.env`, even when `CLAUDE_STACK_ENV` points elsewhere;
+  `envfile.env_path()` knows the real path.
+* `config/stack.env.example:93` sends `FAL_KEY` users to `bin/stack mcp enable fal`, the project-scope route of item 20.
+* `stack/hooks.py:496-503`: a session's history row and the session-end apply depend on SessionEnd alone. SessionStart catches up
+  the apply (`_apply_learned`, `:514-539`) but not the history row of a session that never ran SessionEnd; a catch-up
+  `learn run` for unlearned transcripts at SessionStart would make the overlay's backstop timer (PITFALLS 50) unnecessary.

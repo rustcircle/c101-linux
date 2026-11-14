@@ -1,0 +1,20 @@
+# c101-linux managed unit
+# Backstop for c101's learning loop: runs `stack learn run` for Claude Code sessions whose SessionEnd hook never ran
+# (Desktop quit, logout, crash), so their statistics (stack-data/history.jsonl) and learned maxTurns/effort values are
+# not lost. Started by c101-learn-backstop.timer or by hand:
+#   systemctl --user start c101-learn-backstop.service      (then: journalctl --user -u c101-learn-backstop)
+# Preview without running anything: ~/.local/bin/c101-learn-backstop --dry-run
+[Unit]
+Description=c101 learning backstop for sessions that ended without SessionEnd
+Documentation=file://%h/.claude/stack/docs/reference/learning.md
+ConditionPathExists=%h/.claude/stack/bin/stack
+
+[Service]
+Type=oneshot
+# User units get a minimal PATH: c101's bin/stack needs uv (or its .venv); cover distro, NixOS (system, per-user,
+# nix-env) and Homebrew-on-Linux locations.
+Environment=PATH=%h/.local/bin:%h/.nix-profile/bin:/etc/profiles/per-user/%u/bin:/run/current-system/sw/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/c101-learn-backstop
+# At most 20 learn runs per start; each waits for stack-data/learn.lock while a SessionEnd run holds it.
+TimeoutStartSec=3600
+Nice=10

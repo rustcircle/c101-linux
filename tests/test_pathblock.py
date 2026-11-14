@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
 from helpers import Sandbox, bash_lib, needs_linux
+from helpers import SECRET_SENTINEL, STACK_EXPECTED_KEYS, STACK_OPTIONAL_KEYS  # Playwright / no-key cases at the end
 
 BEGIN = "# >>> c101-linux >>>"
 END = "# <<< c101-linux <<<"
+KEY_NAMES = ("FAL_KEY",) + STACK_EXPECTED_KEYS + STACK_OPTIONAL_KEYS  # names that must never appear in the block or environment.d
 
 
 @needs_linux
@@ -190,6 +193,77 @@ class PathBlockTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(self.sb.snapshot(), before)
         self.assertFalse((self.sb.base / "state.json").exists())
+
+    # --- Playwright MCP browser (R1): PLAYWRIGHT_MCP_BROWSER=chromium, a browser NAME only, never a key (D6) -----------
+
+    def login_value(self, name: str, **env: str) -> str:
+        """What a fresh login shell exports as `name` after sourcing the profile the block was written to."""
+        res = self.sb.run(["env", "-i", "HOME=%s" % self.sb.home, "PATH=/usr/bin:/bin", *["%s=%s" % kv for kv in env.items()],
+                           "bash", "-lc", 'printf %%s "${%s-unset}"' % name])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout
+
+    def apply_with_keys(self, shell: str = "bash", envd: str = "0", extra: str = "") -> subprocess.CompletedProcess:
+        """path_apply while every key variable of the stack is set in the environment (to a fake sentinel)."""
+        keys = {name: SECRET_SENTINEL for name in KEY_NAMES}
+        res = bash_lib(self.sb, "LOGIN_SHELL=%s\n%s\npath_apply %s" % (shell, extra, envd), **self.env, **keys)
+        self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
+        return res
+
+    def test_playwright_browser_in_the_sh_block(self) -> None:
+        self.apply()
+        text = (self.sb.home / ".profile").read_text()
+        self.assertIn(': "${PLAYWRIGHT_MCP_BROWSER:=chromium}"', text)
+        self.assertIn("export PLAYWRIGHT_MCP_BROWSER", text)
+        self.assertEqual(self.login_value("PLAYWRIGHT_MCP_BROWSER"), "chromium", "Playwright MCP defaults to a Chrome channel Linux rarely has")
+        self.assertEqual(self.login_value("PLAYWRIGHT_MCP_BROWSER", PLAYWRIGHT_MCP_BROWSER="chrome"), "chrome", "the user's own value wins")
+
+    def test_playwright_browser_in_the_fish_block(self) -> None:
+        self.apply("fish")
+        fish = (self.sb.home / ".config" / "fish" / "conf.d" / "c101-linux.fish").read_text()
+        self.assertIn("if not set -q PLAYWRIGHT_MCP_BROWSER", fish)
+        self.assertIn('set -gx PLAYWRIGHT_MCP_BROWSER "chromium"', fish)
+
+    def test_playwright_browser_in_environment_d(self) -> None:
+        self.apply(envd="1")
+        f = self.sb.home / ".config" / "environment.d" / "60-c101-linux.conf"
+        # environment.d(5) ${VAR:-default}: a value already in the user manager's environment is never overridden
+        self.assertRegex(f.read_text(), r"(?m)^PLAYWRIGHT_MCP_BROWSER=\$\{PLAYWRIGHT_MCP_BROWSER:-chromium\}$")
+        before = f.stat().st_mtime_ns
+        self.apply(envd="1")
+        self.assertEqual(f.stat().st_mtime_ns, before, "idempotent")
+
+    def test_playwright_browser_value_follows_the_profile_setting(self) -> None:
+        self.apply(envd="1", extra="ENV_PLAYWRIGHT_BROWSER=msedge")
+        self.assertIn(': "${PLAYWRIGHT_MCP_BROWSER:=msedge}"', (self.sb.home / ".profile").read_text())
+        envd = (self.sb.home / ".config" / "environment.d" / "60-c101-linux.conf").read_text()
+        self.assertIn("PLAYWRIGHT_MCP_BROWSER=${PLAYWRIGHT_MCP_BROWSER:-msedge}", envd)
+
+    def test_playwright_browser_line_is_dropped_when_empty_or_not_a_plain_name(self) -> None:
+        for extra in ('ENV_PLAYWRIGHT_BROWSER=""', "ENV_PLAYWRIGHT_BROWSER='a b\"c'"):
+            with self.subTest(extra=extra):
+                self.apply(envd="1", extra=extra)
+                self.assertNotIn("PLAYWRIGHT_MCP_BROWSER", (self.sb.home / ".profile").read_text())
+                self.assertNotIn("PLAYWRIGHT_MCP_BROWSER", (self.sb.home / ".config" / "environment.d" / "60-c101-linux.conf").read_text())
+
+    def test_no_key_name_or_value_reaches_the_block_or_environment_d(self) -> None:
+        extra = 'ENV_SANDBOX_RUNTIME="podman"\nENV_DOCKER_API=1'
+        res = self.apply_with_keys("bash", "1", extra)
+        sh = (self.sb.home / ".profile").read_text()
+        envd = (self.sb.home / ".config" / "environment.d" / "60-c101-linux.conf").read_text()
+        res_fish = self.apply_with_keys("fish", "0", extra)
+        fish = (self.sb.home / ".config" / "fish" / "conf.d" / "c101-linux.fish").read_text()
+        allowed = {"PATH", "PLAYWRIGHT_MCP_BROWSER", "DESKTOP_SANDBOX_RUNTIME", "DOCKER_HOST", "TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE"}
+        exported = {n for line in re.findall(r"(?m)^\s*export\s+([A-Z_][A-Z0-9_ ]*)$", sh) for n in line.split()}
+        self.assertEqual(exported - allowed, set(), "the profile block may export these names only")
+        self.assertIn("PLAYWRIGHT_MCP_BROWSER", exported)
+        self.assertEqual({n for n in re.findall(r"(?m)^([A-Z_][A-Z0-9_]*)=", envd)} - allowed, set())
+        self.assertEqual({n for n in re.findall(r"(?m)^\s*set\s+-gx\s+(\w+)", fish)} - allowed, set())
+        for label, text in (("sh block", sh), ("environment.d", envd), ("fish block", fish)):
+            for name in KEY_NAMES:
+                self.assertNotIn(name, text, "%s names key variable %s (keys live in ~/.claude/stack.env only)" % (label, name))
+            self.assertEqual(re.findall(r"\b[A-Z][A-Z0-9_]*(?:_KEY|_TOKEN|_SECRET|PASSWORD)\b", text), [], label)
+        self.sb.assert_no_secret_leak(res, res_fish, trees=[self.sb.base])
 
 
 if __name__ == "__main__":
